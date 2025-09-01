@@ -14,8 +14,7 @@ using namespace std;
 
 enum MessageType {
     NICKNAME = 'n',
-    MESSAGE = 'm',
-    DISCONNECT = 'd'
+    MESSAGE = 'm'
 };
 
 struct ProtocolMessage {
@@ -47,15 +46,13 @@ void sendProtocolMessage(int socket, MessageType type, const string& content) {
     send(socket, content.c_str(), content.length(), 0);
 }
 
-ProtocolMessage receiveProtocolMessage(int socket) {
-    ProtocolMessage msg;
+bool receiveProtocolMessage(int socket, ProtocolMessage& msg) {
     char header[4];
     
     // Receive message type (1 byte)
     int bytes_received = recv(socket, header, 1, 0);
     if (bytes_received <= 0) {
-        msg.type = DISCONNECT;
-        return msg;
+        return false; // Connection closed or error
     }
     
     msg.type = static_cast<MessageType>(header[0]);
@@ -64,8 +61,7 @@ ProtocolMessage receiveProtocolMessage(int socket) {
         // Receive nickname length (2 bytes)
         bytes_received = recv(socket, header + 1, 2, 0);
         if (bytes_received <= 0) {
-            msg.type = DISCONNECT;
-            return msg;
+            return false;
         }
         
         uint16_t net_length;
@@ -75,8 +71,7 @@ ProtocolMessage receiveProtocolMessage(int socket) {
         // Receive message length (3 bytes)
         bytes_received = recv(socket, header + 1, 3, 0);
         if (bytes_received <= 0) {
-            msg.type = DISCONNECT;
-            return msg;
+            return false;
         }
         
         // Reconstruct 24-bit length from 3 bytes
@@ -89,29 +84,28 @@ ProtocolMessage receiveProtocolMessage(int socket) {
     char* buffer = new char[msg.length + 1];
     bytes_received = recv(socket, buffer, msg.length, 0);
     if (bytes_received <= 0) {
-        msg.type = DISCONNECT;
         delete[] buffer;
-        return msg;
+        return false;
     }
     
     buffer[msg.length] = '\0';
     msg.content = string(buffer);
     delete[] buffer;
     
-    return msg;
+    return true;
 }
 
 void handleClient(int client_socket, const string& server_nickname) {
     string client_nickname;
+    ProtocolMessage msg;
     
     // Get nickname from client
-    ProtocolMessage nick_msg = receiveProtocolMessage(client_socket);
-    if (nick_msg.type != NICKNAME) {
+    if (!receiveProtocolMessage(client_socket, msg) || msg.type != NICKNAME) {
         close(client_socket);
         return;
     }
     
-    client_nickname = nick_msg.content;
+    client_nickname = msg.content;
     
     // Send server nickname to client
     sendProtocolMessage(client_socket, NICKNAME, server_nickname);
@@ -120,10 +114,8 @@ void handleClient(int client_socket, const string& server_nickname) {
     
     // Handle messages from client
     while (true) {
-        ProtocolMessage msg = receiveProtocolMessage(client_socket);
-        
-        if (msg.type == DISCONNECT) {
-            break;
+        if (!receiveProtocolMessage(client_socket, msg)) {
+            break; // Connection closed
         }
         
         if (msg.type == MESSAGE) {
@@ -164,7 +156,7 @@ int main() {
     getline(cin, server_nickname);
     
     // Create socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }

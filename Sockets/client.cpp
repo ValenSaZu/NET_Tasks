@@ -14,8 +14,7 @@ using namespace std;
 
 enum MessageType {
     NICKNAME = 'n',
-    MESSAGE = 'm',
-    DISCONNECT = 'd'
+    MESSAGE = 'm'
 };
 
 struct ProtocolMessage {
@@ -47,15 +46,13 @@ void sendProtocolMessage(int socket, MessageType type, const string& content) {
     send(socket, content.c_str(), content.length(), 0);
 }
 
-ProtocolMessage receiveProtocolMessage(int socket) {
-    ProtocolMessage msg;
+bool receiveProtocolMessage(int socket, ProtocolMessage& msg) {
     char header[4];
     
     // Receive message type (1 byte)
     int bytes_received = recv(socket, header, 1, 0);
     if (bytes_received <= 0) {
-        msg.type = DISCONNECT;
-        return msg;
+        return false; // Connection closed or error
     }
     
     msg.type = static_cast<MessageType>(header[0]);
@@ -64,8 +61,7 @@ ProtocolMessage receiveProtocolMessage(int socket) {
         // Receive nickname length (2 bytes)
         bytes_received = recv(socket, header + 1, 2, 0);
         if (bytes_received <= 0) {
-            msg.type = DISCONNECT;
-            return msg;
+            return false;
         }
         
         uint16_t net_length;
@@ -75,8 +71,7 @@ ProtocolMessage receiveProtocolMessage(int socket) {
         // Receive message length (3 bytes)
         bytes_received = recv(socket, header + 1, 3, 0);
         if (bytes_received <= 0) {
-            msg.type = DISCONNECT;
-            return msg;
+            return false;
         }
         
         // Reconstruct 24-bit length from 3 bytes
@@ -89,44 +84,34 @@ ProtocolMessage receiveProtocolMessage(int socket) {
     char* buffer = new char[msg.length + 1];
     bytes_received = recv(socket, buffer, msg.length, 0);
     if (bytes_received <= 0) {
-        msg.type = DISCONNECT;
         delete[] buffer;
-        return msg;
+        return false;
     }
     
     buffer[msg.length] = '\0';
     msg.content = string(buffer);
     delete[] buffer;
     
-    return msg;
+    return true;
 }
 
 void receiveMessages(int socket) {
-    string server_nickname;
+    ProtocolMessage msg;
     
     // First message should be server's nickname
-    ProtocolMessage nick_msg = receiveProtocolMessage(socket);
-    if (nick_msg.type == NICKNAME) {
-        server_nickname = nick_msg.content;
-        cout << "Connected to server: " << server_nickname << endl;
+    if (receiveProtocolMessage(socket, msg) && msg.type == NICKNAME) {
+        cout << "Connected to server: " << msg.content << endl;
         cout << "Start chatting! Type 'chau' to disconnect." << endl;
     }
     
     while (true) {
-        ProtocolMessage msg = receiveProtocolMessage(socket);
-        
-        if (msg.type == DISCONNECT) {
+        if (!receiveProtocolMessage(socket, msg)) {
             cout << "Disconnected from server." << endl;
             break;
         }
         
         if (msg.type == MESSAGE) {
-            // Just display the message as-is (server already formatted it)
             cout << msg.content << endl;
-            
-            if (msg.content.find("chau") != string::npos) {
-                break;
-            }
         }
     }
 }
@@ -140,7 +125,7 @@ void handleClientInput(int socket) {
 }
 
 int main() {
-    int sock = 0;
+    int sock;
     struct sockaddr_in serv_addr;
     
     // Get client nickname
@@ -149,7 +134,7 @@ int main() {
     getline(cin, nickname);
     
     // Create socket
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    if ((sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
         cout << "Socket creation error" << endl;
         return -1;
     }
@@ -157,9 +142,8 @@ int main() {
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(PORT);
     
-    // Convert IPv4 address from text to binary form
     if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
-        cout << "Invalid address/ Address not supported" << endl;
+        cout << "Invalid address" << endl;
         return -1;
     }
     
