@@ -10,161 +10,161 @@
 using namespace std;
 
 #define PORT 45000
-#define BUFFER_SIZE 1024
 
-enum MessageType {
-    NICKNAME = 'n',
-    MESSAGE = 'm'
-};
+/*
+    n: Nickname (client → server)
+    m: Broadcast message (client → server)
+    t: Private message (client → server)
+    l: List of clients (client → server)
+    E: Error (server → client)
+    M: Broadcast message (server → client)
+    T: Private message (server → client)
+    L: List of clients (server → client)
+*/
 
-struct ProtocolMessage {
-    MessageType type;
-    int length;
-    string content;
-};
-
-void sendProtocolMessage(int socket, MessageType type, const string& content) {
-    // Create header: type (1 byte) + length (2 or 3 bytes)
-    char header[4];
-    header[0] = static_cast<char>(type);
-    
-    if (type == NICKNAME) {
-        // 2 bytes for nickname length
-        uint16_t net_length = htons(content.length());
-        memcpy(header + 1, &net_length, 2);
-        send(socket, header, 3, 0);
-    } else {
-        // 3 bytes for message length
-        uint32_t length = content.length();
-        // Store in 3 bytes (24 bits)
-        header[1] = (length >> 16) & 0xFF;
-        header[2] = (length >> 8) & 0xFF;
-        header[3] = length & 0xFF;
-        send(socket, header, 4, 0);
-    }
-    
-    send(socket, content.c_str(), content.length(), 0);
+void sendNickname(int sock, const string nick) {
+    string packet = "n";
+    uint16_t len = htons(nick.size());
+    packet.append((char*)&len,2);
+    packet += nick;
+    send(sock, packet.c_str(), packet.size(), 0);
 }
 
-bool receiveProtocolMessage(int socket, ProtocolMessage& msg) {
-    char header[4];
-    
-    // Receive message type (1 byte)
-    int bytes_received = recv(socket, header, 1, 0);
-    if (bytes_received <= 0) {
-        return false; // Connection closed or error
-    }
-    
-    msg.type = static_cast<MessageType>(header[0]);
-    
-    if (msg.type == NICKNAME) {
-        // Receive nickname length (2 bytes)
-        bytes_received = recv(socket, header + 1, 2, 0);
-        if (bytes_received <= 0) {
-            return false;
-        }
-        
-        uint16_t net_length;
-        memcpy(&net_length, header + 1, 2);
-        msg.length = ntohs(net_length);
-    } else {
-        // Receive message length (3 bytes)
-        bytes_received = recv(socket, header + 1, 3, 0);
-        if (bytes_received <= 0) {
-            return false;
-        }
-        
-        // Reconstruct 24-bit length from 3 bytes
-        msg.length = (static_cast<unsigned char>(header[1]) << 16) |
-                     (static_cast<unsigned char>(header[2]) << 8) |
-                     static_cast<unsigned char>(header[3]);
-    }
-    
-    // Receive content
-    char* buffer = new char[msg.length + 1];
-    bytes_received = recv(socket, buffer, msg.length, 0);
-    if (bytes_received <= 0) {
-        delete[] buffer;
-        return false;
-    }
-    
-    buffer[msg.length] = '\0';
-    msg.content = string(buffer);
-    delete[] buffer;
-    
-    return true;
+void sendBroadcast(int sock, const string msg) {
+    string packet = "m";
+    uint32_t len = msg.size();
+    packet.push_back((len>>16)&0xFF);
+    packet.push_back((len>>8)&0xFF);
+    packet.push_back(len&0xFF);
+    packet += msg;
+    send(sock, packet.c_str(), packet.size(), 0);
 }
 
-void receiveMessages(int socket) {
-    ProtocolMessage msg;
-    
-    // First message should be server's nickname
-    if (receiveProtocolMessage(socket, msg) && msg.type == NICKNAME) {
-        cout << "Connected to server: " << msg.content << endl;
-        cout << "Start chatting! Type 'chau' to disconnect." << endl;
-    }
-    
+void sendToClient(int sock, const string dest, const string msg) {
+    string packet = "t";
+    uint16_t dlen = htons(dest.size());
+    packet.append((char*)&dlen,2);
+    packet += dest;
+    uint32_t mlen = msg.size();
+    packet.push_back((mlen>>16)&0xFF);
+    packet.push_back((mlen>>8)&0xFF);
+    packet.push_back(mlen&0xFF);
+    packet += msg;
+    send(sock, packet.c_str(), packet.size(), 0);
+}
+
+void requestList(int sock) {
+    string packet = "l";
+    send(sock, packet.c_str(), 1, 0);
+}
+
+// Receiver thread
+void receiveMessages(int sock) {
+    char header[4];
     while (true) {
-        if (!receiveProtocolMessage(socket, msg)) {
-            cout << "Disconnected from server." << endl;
+        int r = recv(sock, header, 1, 0);
+        if (r<=0) { cout << "Disconnected.\n"; break; }
+        char type = header[0];
+
+        if (type=='E') {
+            recv(sock, header, 3, 0);
+            int len = ((unsigned char)header[0] << 16) |
+                    ((unsigned char)header[1] << 8) |
+                    (unsigned char)header[2];
+            char* buf = new char[len+1];
+            recv(sock, buf, len, 0);
+            buf[len]='\0';
+            cout << "[Error] " << buf << endl;
+            delete[] buf;
             break;
         }
-        
-        if (msg.type == MESSAGE) {
-            cout << msg.content << endl;
+        else if (type=='M') {
+            recv(sock, header,3,0);
+            int len = ((unsigned char)header[0]<<16)|
+                      ((unsigned char)header[1]<<8)|
+                      (unsigned char)header[2];
+            char* buf=new char[len+1];
+            recv(sock,buf,len,0); buf[len]='\0';
+            cout << "[Broadcast] " << buf << endl;
+            delete[] buf;
+        }
+        else if (type=='T') {
+            recv(sock, header,2,0);
+            uint16_t dlen; memcpy(&dlen,header,2); dlen=ntohs(dlen);
+            char* dbuf=new char[dlen+1];
+            recv(sock,dbuf,dlen,0); dbuf[dlen]='\0';
+            string dest(dbuf);
+            delete[] dbuf;
+
+            recv(sock,header,3,0);
+            int mlen = ((unsigned char)header[0]<<16)|
+                       ((unsigned char)header[1]<<8)|
+                       (unsigned char)header[2];
+            char* mbuf=new char[mlen+1];
+            recv(sock,mbuf,mlen,0); mbuf[mlen]='\0';
+            cout << "[Private to " << dest << "] " << mbuf << endl;
+            delete[] mbuf;
+        }
+        else if (type=='L') {
+            recv(sock, header,2,0);
+            uint16_t len; memcpy(&len,header,2); len=ntohs(len);
+            char* buf=new char[len+1];
+            recv(sock,buf,len,0); buf[len]='\0';
+            cout << "[Clients] " << buf << endl;
+            delete[] buf;
         }
     }
-}
-
-void handleClientInput(int socket) {
-    string message;
-    do {
-        getline(cin, message);
-        sendProtocolMessage(socket, MESSAGE, message);
-    } while (message != "chau");
 }
 
 int main() {
     int sock;
     struct sockaddr_in serv_addr;
-    
-    // Get client nickname
-    string nickname;
-    cout << "Enter your nickname: ";
-    getline(cin, nickname);
-    
-    // Create socket
-    if ((sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-        cout << "Socket creation error" << endl;
-        return -1;
-    }
-    
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(PORT);
-    
-    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
-        cout << "Invalid address" << endl;
-        return -1;
+    inet_pton(AF_INET,"127.0.0.1",&serv_addr.sin_addr);
+
+    if (connect(sock,(struct sockaddr*)&serv_addr,sizeof(serv_addr))<0) {
+        cout << "Connection failed\n"; return 0;
     }
-    
-    // Connect to server
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        cout << "Connection Failed" << endl;
-        return -1;
+
+    string nickname;
+    cout << "Enter nickname: ";
+    getline(cin,nickname);
+    sendNickname(sock,nickname);
+
+    thread t(receiveMessages,sock);
+
+    cout << "Commands:\n"
+         << "  /all msg   -> broadcast\n"
+         << "  /to user msg -> private\n"
+         << "  /list -> show users\n"
+         << "  /exit -> quit\n";
+
+    string line;
+    while (getline(cin,line)) {
+        if (line=="/exit") break;
+        if (line.rfind("/all ",0)==0) {
+            sendBroadcast(sock,line.substr(5));
+        }
+        else if (line.rfind("/to ",0)==0) {
+            size_t sp=line.find(' ',4);
+            if (sp!=string::npos) {
+                string dest=line.substr(4,sp-4);
+                string msg=line.substr(sp+1);
+                sendToClient(sock,dest,msg);
+            }
+        }
+        else if (line=="/list") {
+            requestList(sock);
+        }
+        else {
+            cout << "Unknown command\n";
+        }
     }
-    
-    // Send nickname to server
-    sendProtocolMessage(sock, NICKNAME, nickname);
-    
-    // Start thread to receive messages
-    thread receiver(receiveMessages, sock);
-    
-    // Handle client input in the main thread
-    handleClientInput(sock);
-    
-    // Clean up
-    receiver.join();
+
     close(sock);
-    
+    t.join();
     return 0;
 }

@@ -1,6 +1,9 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <map>
+#include <vector>
+#include <mutex>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
@@ -12,202 +15,210 @@ using namespace std;
 #define PORT 45000
 #define BUFFER_SIZE 1024
 
-enum MessageType {
-    NICKNAME = 'n',
-    MESSAGE = 'm'
-};
+map<string,int> clients;   // nickname, socket
+mutex clients_mutex;
 
-struct ProtocolMessage {
-    MessageType type;
-    int length;
-    string content;
-};
+/*
+    n: Nickname (client → server)
+    m: Broadcast message (client → server)
+    t: Private message (client → server)
+    l: List of clients (client → server)
+    E: Error (server → client)
+    M: Broadcast message (server → client)
+    T: Private message (server → client)
+    L: List of clients (server → client)
+*/
 
-void sendProtocolMessage(int socket, MessageType type, const string& content) {
-    // Create header: type (1 byte) + length (2 or 3 bytes)
-    char header[4];
-    header[0] = static_cast<char>(type);
-    
-    if (type == NICKNAME) {
-        // 2 bytes for nickname length
-        uint16_t net_length = htons(content.length());
-        memcpy(header + 1, &net_length, 2);
-        send(socket, header, 3, 0);
-    } else {
-        // 3 bytes for message length
-        uint32_t length = content.length();
-        // Store in 3 bytes (24 bits)
-        header[1] = (length >> 16) & 0xFF;
-        header[2] = (length >> 8) & 0xFF;
-        header[3] = length & 0xFF;
-        send(socket, header, 4, 0);
+// send a message to everyone except who is sending
+// for messages to everyone dont put the sender and send to everyone (-1)
+void sendAll(const string data, int sender_client = -1) {
+    lock_guard<mutex> lock(clients_mutex); // dont modify clients while is sending
+    for (auto client : clients) {
+        if (client.second != sender_client) {
+            send(client.second, data.c_str(), data.size(), 0);
+        }
     }
-    
-    send(socket, content.c_str(), content.length(), 0);
 }
 
-bool receiveProtocolMessage(int socket, ProtocolMessage& msg) {
+// send a message to a specific client
+void sendToClient(const string dest, const string data) {
+    lock_guard<mutex> lock(clients_mutex);
+    if (clients.count(dest)) {
+        send(clients[dest], data.c_str(), data.size(), 0);
+    }
+}
+
+// Build the error message with the protocol
+// 'E' + [3 bytes] + [message]
+string buildError(const string& msg) {
+    string packet = "E";
+    uint32_t len = msg.size();
+    packet.push_back((len >> 16) & 0xFF);
+    packet.push_back((len >> 8) & 0xFF);
+    packet.push_back(len & 0xFF);
+    packet += msg;
+    return packet;
+}
+
+// Build the message with the protocol
+// 'M' + [3 bytes] + [message]
+string buildBroadcast(const string& msg) {
+    string packet = "M";
+    uint32_t len = msg.size();
+    packet.push_back((len>>16)&0xFF);
+    packet.push_back((len>>8)&0xFF);
+    packet.push_back(len&0xFF);
+    packet += msg;
+    return packet;
+}
+
+// Build the message to a specific client with the protocol
+// 'T' + [2 bytes] + [destinity] + [3 bytes] + [message]
+string buildToClient(const string& dest, const string& msg) {
+    string packet = "T";
+    uint16_t dlen = htons(dest.size()); //nickname of the receiver client length
+    packet.append((char*)&dlen,2); // add the length + [2 bytes]
+    packet += dest;
+    uint32_t mlen = msg.size();
+    packet.push_back((mlen>>16)&0xFF);
+    packet.push_back((mlen>>8)&0xFF);
+    packet.push_back(mlen&0xFF);
+    packet += msg;
+    return packet;
+}
+
+//Build list with the protocol
+// 'L' + [2 bytes] + [list]
+string buildList() {
+    lock_guard<mutex> lock(clients_mutex);
+    string all;
+    for (auto client : clients) {
+        if (!all.empty()) all += ",";
+        all += client.first; //add nicknames
+    }
+    string packet = "L";
+    uint16_t len = htons(all.size());
+    packet.append((char*)&len,2);
+    packet += all;
+    return packet;
+}
+
+// Manage each client with threads
+void handleClient(int client_socket) {
     char header[4];
-    
-    // Receive message type (1 byte)
-    int bytes_received = recv(socket, header, 1, 0);
-    if (bytes_received <= 0) {
-        return false; // Connection closed or error
-    }
-    
-    msg.type = static_cast<MessageType>(header[0]);
-    
-    if (msg.type == NICKNAME) {
-        // Receive nickname length (2 bytes)
-        bytes_received = recv(socket, header + 1, 2, 0);
-        if (bytes_received <= 0) {
-            return false;
-        }
-        
-        uint16_t net_length;
-        memcpy(&net_length, header + 1, 2);
-        msg.length = ntohs(net_length);
-    } else {
-        // Receive message length (3 bytes)
-        bytes_received = recv(socket, header + 1, 3, 0);
-        if (bytes_received <= 0) {
-            return false;
-        }
-        
-        // Reconstruct 24-bit length from 3 bytes
-        msg.length = (static_cast<unsigned char>(header[1]) << 16) |
-                     (static_cast<unsigned char>(header[2]) << 8) |
-                     static_cast<unsigned char>(header[3]);
-    }
-    
-    // Receive content
-    char* buffer = new char[msg.length + 1];
-    bytes_received = recv(socket, buffer, msg.length, 0);
-    if (bytes_received <= 0) {
-        delete[] buffer;
-        return false;
-    }
-    
-    buffer[msg.length] = '\0';
-    msg.content = string(buffer);
+    string nickname;
+
+    // Read nickname (n)
+    if (recv(client_socket, header, 1, 0) <= 0) { close(client_socket); return; }
+    if (header[0] != 'n') { close(client_socket); return; }
+
+    //length of nickname
+    if (recv(client_socket, header, 2, 0) <= 0) { close(client_socket); return; }
+    uint16_t nlen;
+    memcpy(&nlen, header, 2);
+    nlen = ntohs(nlen);
+
+    //take the nickname
+    char* buffer = new char[nlen+1];
+    if (recv(client_socket, buffer, nlen, 0) <= 0) { delete[] buffer; close(client_socket); return; }
+    buffer[nlen]='\0';
+    nickname = string(buffer);
     delete[] buffer;
-    
-    return true;
-}
 
-void handleClient(int client_socket, const string& server_nickname) {
-    string client_nickname;
-    ProtocolMessage msg;
-    
-    // Get nickname from client
-    if (!receiveProtocolMessage(client_socket, msg) || msg.type != NICKNAME) {
+    lock_guard<mutex> lock(clients_mutex);
+    if (clients.count(nickname)) {
+        string err = buildError("Nickname already taken");
+        send(client_socket, err.c_str(), err.size(), 0);
         close(client_socket);
         return;
     }
-    
-    client_nickname = msg.content;
-    
-    // Send server nickname to client
-    sendProtocolMessage(client_socket, NICKNAME, server_nickname);
-    
-    cout << client_nickname << " joined the chat." << endl;
-    
-    // Handle messages from client
+    clients[nickname] = client_socket;
+
+    cout << nickname << " joined" << endl;
+    string joinMsg = buildBroadcast(nickname + " joined the chat");
+    sendAll(joinMsg);
+
     while (true) {
-        if (!receiveProtocolMessage(client_socket, msg)) {
-            break; // Connection closed
+        char type;
+        int r = recv(client_socket, &type, 1, 0);
+        if (r <= 0) break;
+
+        if (type == 'm') {
+            // broadcast
+            if (recv(client_socket, header, 3, 0) <= 0) break;
+            int len = ((unsigned char)header[0]<<16) |
+                      ((unsigned char)header[1]<<8) |
+                      (unsigned char)header[2];
+            char* buf = new char[len+1];
+            if (recv(client_socket, buf, len, 0) <= 0) { delete[] buf; break; }
+            buf[len]='\0';
+            string msg = string(buf);
+            delete[] buf;
+            string packet = buildBroadcast(nickname + ": " + msg);
+            sendAll(packet, client_socket);
         }
-        
-        if (msg.type == MESSAGE) {
-            // Format and display client's message
-            cout << "(" << client_nickname << "): " << msg.content << endl;
-            
-            if (msg.content == "chau") {
-                break;
-            }
+        else if (type == 't') {
+            // to client
+            if (recv(client_socket, header, 2, 0) <= 0) break;
+            uint16_t dlen;
+            memcpy(&dlen, header, 2);
+            dlen = ntohs(dlen);
+            char* dbuf = new char[dlen+1];
+            if (recv(client_socket, dbuf, dlen, 0) <= 0) { delete[] dbuf; break; }
+            dbuf[dlen]='\0';
+            string dest(dbuf);
+            delete[] dbuf;
+
+            if (recv(client_socket, header, 3, 0) <= 0) break;
+            int mlen = ((unsigned char)header[0]<<16) |
+                       ((unsigned char)header[1]<<8) |
+                       (unsigned char)header[2];
+            char* mbuf = new char[mlen+1];
+            if (recv(client_socket, mbuf, mlen, 0) <= 0) { delete[] mbuf; break; }
+            mbuf[mlen]='\0';
+            string msg(mbuf);
+            delete[] mbuf;
+
+            string packet = buildToClient(dest, nickname + "->" + dest + ": " + msg);
+            sendToClient(dest, packet);
+        }
+        else if (type == 'l') {
+            string listMsg = buildList();
+            send(client_socket, listMsg.c_str(), listMsg.size(), 0);
         }
     }
-    
-    cout << client_nickname << " left the chat." << endl;
+
+    {
+        lock_guard<mutex> lock(clients_mutex);
+        clients.erase(nickname);
+    }
+    cout << nickname << " left." << endl;
     close(client_socket);
 }
 
-void handleServerInput(int client_socket, const string& server_nickname) {
-    string message;
-    do {
-        getline(cin, message);
-        
-        // Format the message before sending
-        string formatted_msg = "(" + server_nickname + "): " + message;
-        sendProtocolMessage(client_socket, MESSAGE, formatted_msg);
-        
-    } while (message != "chau");
-}
-
+// Main ---------------------------------------------------------
 int main() {
-    int server_fd, client_socket;
+    int clientSocket;
     struct sockaddr_in address;
-    int opt = 1;
-    int addrlen = sizeof(address);
-    
-    // Get server nickname
-    string server_nickname;
-    cout << "Enter server nickname: ";
-    getline(cin, server_nickname);
-    
-    // Create socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Set socket options
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-    
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-    
-    // Bind socket
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    
-    // Listen for connections
-    if (listen(server_fd, 1) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-    
-    cout << "Server '" << server_nickname << "' started on port " << PORT << endl;
-    
+    int opt=1;
+    int addrlen=sizeof(address);
+
+    clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(clientSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    address.sin_family=AF_INET;
+    address.sin_addr.s_addr=INADDR_ANY;
+    address.sin_port=htons(PORT);
+
+    bind(clientSocket, (struct sockaddr*)&address, sizeof(address));
+    listen(clientSocket, 5);
+
+    cout << "Server running on port " << PORT << endl;
+
     while (true) {
-        cout << "Waiting for a client to connect..." << endl;
-        
-        // Accept incoming connection
-        if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept");
-            exit(EXIT_FAILURE);
-        }
-        
-        cout << "Client connected. Starting chat session..." << endl;
-        
-        // Handle client in a separate thread
-        thread client_thread(handleClient, client_socket, server_nickname);
-        
-        // Handle server input in the main thread
-        handleServerInput(client_socket, server_nickname);
-        
-        // Wait for client thread to finish
-        client_thread.join();
-        
-        cout << "Chat session ended. Ready for a new client." << endl;
+        int client_socket = accept(clientSocket, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        thread(handleClient, client_socket).detach();
     }
-    
-    close(server_fd);
+
+    close(clientSocket);
     return 0;
 }
