@@ -16,7 +16,7 @@ using namespace std;
 
 #define PORT 45000
 
-map<string,int> clients;   // nickname, socket
+map<string,int> clients;
 mutex clients_mutex;
 
 /*
