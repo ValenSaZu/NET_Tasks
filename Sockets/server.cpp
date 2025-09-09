@@ -9,11 +9,12 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 
 using namespace std;
 
 #define PORT 45000
-#define BUFFER_SIZE 1024
 
 map<string,int> clients;   // nickname, socket
 mutex clients_mutex;
@@ -23,18 +24,38 @@ mutex clients_mutex;
     m: Broadcast message (client → server)
     t: Private message (client → server)
     l: List of clients (client → server)
+    x: Close connection (client → server)
     E: Error (server → client)
     M: Broadcast message (server → client)
     T: Private message (server → client)
     L: List of clients (server → client)
+    X: Close connection (server → client)
 */
 
+// Helper function to print protocol data in hex
+string formatProtocol(const string& data) {
+    stringstream ss;
+    for (char c : data) {
+        if (isprint(c) && c != ' ') {
+            ss << c;
+        } else {
+            ss << "\\x" << hex << setw(2) << setfill('0') << (int)(unsigned char)c;
+        }
+    }
+    return ss.str();
+}
+
+// Build close connection message
+string buildClose() {
+    return "X"; // Single byte message
+}
+
 // send a message to everyone except who is sending
-// for messages to everyone dont put the sender and send to everyone (-1)
 void sendAll(const string data, int sender_client = -1) {
-    lock_guard<mutex> lock(clients_mutex); // dont modify clients while is sending
+    lock_guard<mutex> lock(clients_mutex);
     for (auto client : clients) {
         if (client.second != sender_client) {
+            cout << "Server sending to " << client.first << ": " << formatProtocol(data) << endl;
             send(client.second, data.c_str(), data.size(), 0);
         }
     }
@@ -44,12 +65,12 @@ void sendAll(const string data, int sender_client = -1) {
 void sendToClient(const string dest, const string data) {
     lock_guard<mutex> lock(clients_mutex);
     if (clients.count(dest)) {
+        cout << "Server sending to " << dest << ": " << formatProtocol(data) << endl;
         send(clients[dest], data.c_str(), data.size(), 0);
     }
 }
 
 // Build the error message with the protocol
-// 'E' + [3 bytes] + [message]
 string buildError(const string& msg) {
     string packet = "E";
     uint32_t len = msg.size();
@@ -61,44 +82,46 @@ string buildError(const string& msg) {
 }
 
 // Build the message with the protocol
-// 'M' + [3 bytes] + [message]
-string buildBroadcast(const string& msg) {
+string buildBroadcast(const string& sender, const string& msg) {
     string packet = "M";
-    uint32_t len = msg.size();
-    packet.push_back((len>>16)&0xFF);
-    packet.push_back((len>>8)&0xFF);
-    packet.push_back(len&0xFF);
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    uint32_t mlen = msg.size();
+    packet.push_back((mlen >> 16) & 0xFF);
+    packet.push_back((mlen >> 8) & 0xFF);
+    packet.push_back(mlen & 0xFF);
     packet += msg;
     return packet;
 }
 
 // Build the message to a specific client with the protocol
-// 'T' + [2 bytes] + [destinity] + [3 bytes] + [message]
-string buildToClient(const string& dest, const string& msg) {
+string buildToClient(const string& sender, const string& msg) {
     string packet = "T";
-    uint16_t dlen = htons(dest.size()); //nickname of the receiver client length
-    packet.append((char*)&dlen,2); // add the length + [2 bytes]
-    packet += dest;
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
     uint32_t mlen = msg.size();
-    packet.push_back((mlen>>16)&0xFF);
-    packet.push_back((mlen>>8)&0xFF);
-    packet.push_back(mlen&0xFF);
+    packet.push_back((mlen >> 16) & 0xFF);
+    packet.push_back((mlen >> 8) & 0xFF);
+    packet.push_back(mlen & 0xFF);
     packet += msg;
     return packet;
 }
 
 //Build list with the protocol
-// 'L' + [2 bytes] + [list]
 string buildList() {
     lock_guard<mutex> lock(clients_mutex);
     string all;
     for (auto client : clients) {
-        if (!all.empty()) all += ",";
-        all += client.first; //add nicknames
+        uint16_t nick_len = htons(client.first.size());
+        all.append((char*)&nick_len, 2);
+        all += client.first;
     }
+    
     string packet = "L";
-    uint16_t len = htons(all.size());
-    packet.append((char*)&len,2);
+    uint16_t total_len = htons(all.size());
+    packet.append((char*)&total_len, 2);
     packet += all;
     return packet;
 }
@@ -125,17 +148,28 @@ void handleClient(int client_socket) {
     nickname = string(buffer);
     delete[] buffer;
 
-    lock_guard<mutex> lock(clients_mutex);
-    if (clients.count(nickname)) {
-        string err = buildError("Nickname already taken");
-        send(client_socket, err.c_str(), err.size(), 0);
-        close(client_socket);
-        return;
+    // Print received nickname protocol
+    string nickPacket = "n";
+    uint16_t nlen_net = htons(nlen);
+    nickPacket.append((char*)&nlen_net, 2);
+    nickPacket += nickname;
+    cout << nickname << " received: " << formatProtocol(nickPacket) << endl;
+
+    {
+        lock_guard<mutex> lock(clients_mutex);
+        if (clients.count(nickname)) {
+            string err = buildError("Nickname already taken");
+            cout << "Server sending error to " << nickname << ": " << formatProtocol(err) << endl;
+            send(client_socket, err.c_str(), err.size(), 0);
+            close(client_socket);
+            return;
+        }
+        clients[nickname] = client_socket;
     }
-    clients[nickname] = client_socket;
 
     cout << nickname << " joined" << endl;
-    string joinMsg = buildBroadcast(nickname + " joined the chat");
+    string joinMsg = buildBroadcast(nickname," joined the chat");
+    cout << "Server broadcasting: " << formatProtocol(joinMsg) << endl;
     sendAll(joinMsg);
 
     while (true) {
@@ -154,7 +188,13 @@ void handleClient(int client_socket) {
             buf[len]='\0';
             string msg = string(buf);
             delete[] buf;
-            string packet = buildBroadcast(nickname + ": " + msg);
+            
+            string broadcastPacket = "m";
+            broadcastPacket += string(header, 3);
+            broadcastPacket += msg;
+            cout << nickname << " received: " << formatProtocol(broadcastPacket) << endl;
+            
+            string packet = buildBroadcast(nickname, msg);
             sendAll(packet, client_socket);
         }
         else if (type == 't') {
@@ -179,12 +219,34 @@ void handleClient(int client_socket) {
             string msg(mbuf);
             delete[] mbuf;
 
-            string packet = buildToClient(dest, nickname + "->" + dest + ": " + msg);
-            sendToClient(dest, packet);
+            string privatePacket = "t";
+            uint16_t dlen_net = htons(dlen);
+            privatePacket.append((char*)&dlen_net, 2);
+            privatePacket += dest;
+            privatePacket += string(header, 3);
+            privatePacket += msg;
+            cout << nickname << " received: " << formatProtocol(privatePacket) << endl;
+
+            if (clients.count(dest)) {
+                string packet = buildToClient(nickname, msg);
+                sendToClient(dest, packet);
+            } else {
+                string err = buildError("User " + dest + " not found");
+                sendToClient(nickname, err);
+            }
         }
         else if (type == 'l') {
+            cout << nickname << " received: l" << endl;
             string listMsg = buildList();
+            cout << "Server sending list to " << nickname << ": " << formatProtocol(listMsg) << endl;
             send(client_socket, listMsg.c_str(), listMsg.size(), 0);
+        }
+        else if (type == 'x') {
+            cout << nickname << " received: x" << endl;
+            string closeMsg = buildClose();
+            cout << "Server sending close to " << nickname << ": " << formatProtocol(closeMsg) << endl;
+            send(client_socket, closeMsg.c_str(), closeMsg.size(), 0);
+            break;
         }
     }
 
@@ -193,32 +255,36 @@ void handleClient(int client_socket) {
         clients.erase(nickname);
     }
     cout << nickname << " left." << endl;
+    
+    string leaveMsg = buildBroadcast(nickname, " left the chat");
+    cout << "Server broadcasting: " << formatProtocol(leaveMsg) << endl;
+    sendAll(leaveMsg);
+    
     close(client_socket);
 }
 
-// Main ---------------------------------------------------------
 int main() {
-    int clientSocket;
+    int serverSocket;
     struct sockaddr_in address;
     int opt=1;
     int addrlen=sizeof(address);
 
-    clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-    setsockopt(clientSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     address.sin_family=AF_INET;
     address.sin_addr.s_addr=INADDR_ANY;
     address.sin_port=htons(PORT);
 
-    bind(clientSocket, (struct sockaddr*)&address, sizeof(address));
-    listen(clientSocket, 5);
+    bind(serverSocket, (struct sockaddr*)&address, sizeof(address));
+    listen(serverSocket, 5);
 
     cout << "Server running on port " << PORT << endl;
 
     while (true) {
-        int client_socket = accept(clientSocket, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+        int client_socket = accept(serverSocket, (struct sockaddr*)&address, (socklen_t*)&addrlen);
         thread(handleClient, client_socket).detach();
     }
 
-    close(clientSocket);
+    close(serverSocket);
     return 0;
 }
