@@ -25,11 +25,13 @@ mutex clients_mutex;
     t: Private message (client → server)
     l: List of clients (client → server)
     x: Close connection (client → server)
+    f: Send files (client → server)
     E: Error (server → client)
     M: Broadcast message (server → client)
     T: Private message (server → client)
     L: List of clients (server → client)
     X: Close connection (server → client)
+    F: Send files (server → client)
 */
 
 // Helper function to print protocol data in hex
@@ -123,6 +125,35 @@ string buildList() {
     uint16_t total_len = htons(all.size());
     packet.append((char*)&total_len, 2);
     packet += all;
+    return packet;
+}
+
+// Función para construir mensaje de archivo
+string buildFile(const string& sender, const string& filename, const char* file_data, uint64_t file_size) {
+    string packet = "F"; // Tipo 'F' para archivo
+    
+    // Remitente
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    
+    // Longitud del nombre del archivo (3 bytes)
+    uint32_t flen = filename.size();
+    packet.push_back((flen >> 16) & 0xFF);
+    packet.push_back((flen >> 8) & 0xFF);
+    packet.push_back(flen & 0xFF);
+    
+    // Nombre del archivo
+    packet += filename;
+    
+    // Tamaño del archivo
+    for (int i = 9; i >= 0; i--) {
+        packet.push_back((file_size >> (i * 8)) & 0xFF);
+    }
+    
+    // Contenido del archivo
+    packet.append(file_data, file_size);
+    
     return packet;
 }
 
@@ -247,6 +278,83 @@ void handleClient(int client_socket) {
             cout << "Server sending close to " << nickname << ": " << formatProtocol(closeMsg) << endl;
             send(client_socket, closeMsg.c_str(), closeMsg.size(), 0);
             break;
+        }
+        else if (type=='f') {
+            if (recv(client_socket, header, 2, 0) <= 0) break;
+            uint16_t dlen;
+            memcpy(&dlen, header, 2);
+            dlen = ntohs(dlen);
+            char* dbuf = new char[dlen+1];
+            
+            int bytes_received = 0;
+            while (bytes_received < dlen) {
+                int r = recv(client_socket, dbuf + bytes_received, dlen - bytes_received, 0);
+                if (r <= 0) { delete[] dbuf; break; }
+                bytes_received += r;
+            }
+            dbuf[dlen]='\0';
+            string dest(dbuf);
+            delete[] dbuf;
+
+            if (recv(client_socket, header, 3, 0) <= 0) break;
+            uint32_t flen = ((unsigned char)header[0] << 16) |
+                        ((unsigned char)header[1] << 8) |
+                        (unsigned char)header[2];
+
+            char* fbuf = new char[flen+1];
+            bytes_received = 0;
+            while (bytes_received < flen) {
+                int r = recv(client_socket, fbuf + bytes_received, flen - bytes_received, 0);
+                if (r <= 0) { delete[] fbuf; break; }
+                bytes_received += r;
+            }
+            fbuf[flen] = '\0';
+            string filename(fbuf);
+            delete[] fbuf;
+
+            char size_buf[10];
+            bytes_received = 0;
+            while (bytes_received < 10) {
+                int r = recv(client_socket, size_buf + bytes_received, 10 - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+            
+            uint64_t fsize = 0;
+            for (int i = 0; i < 10; i++) {
+                fsize = (fsize << 8) | (unsigned char)size_buf[i];
+            }
+
+            char* file_data = new char[fsize];
+            bytes_received = 0;
+            while (bytes_received < fsize) {
+                int r = recv(client_socket, file_data + bytes_received, fsize - bytes_received, 0);
+                if (r <= 0) { 
+                    delete[] file_data; 
+                    break; 
+                }
+                bytes_received += r;
+            }
+
+            string filePacket = "f";
+            uint16_t dlen_net = htons(dlen);
+            filePacket.append((char*)&dlen_net, 2);
+            filePacket += dest;
+            filePacket += string(header, 3);
+            filePacket += filename;
+            filePacket += string(size_buf, 10);
+            cout << nickname << " received file: " << formatProtocol(filePacket.substr(0, 50)) << "..." << endl;
+
+            if (clients.count(dest)) {
+                string packet = buildFile(nickname, filename, file_data, fsize);
+                sendToClient(dest, packet);
+                cout << "Archivo " << filename << " (" << fsize << " bytes) enviado a " << dest << endl;
+            } else {
+                string err = buildError("User " + dest + " not found");
+                sendToClient(nickname, err);
+            }
+            
+            delete[] file_data;
         }
     }
 

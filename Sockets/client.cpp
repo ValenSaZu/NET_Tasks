@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
+#include <fstream>
 
 using namespace std;
 
@@ -20,11 +21,13 @@ using namespace std;
     t: Private message (client → server)
     l: List of clients (client → server)
     x: Close connection (client → server)
+    f: Send files (client → server)
     E: Error (server → client)
     M: Broadcast message (server → client)
     T: Private message (server → client)
     L: List of clients (server → client)
     X: Close connection (server → client)
+    F: Send files (server → client)
 */
 
 // Helper function to print protocol data in hex
@@ -112,6 +115,54 @@ void parseListResponse(char* buf, int len) {
         cout << clients[i];
     }
     cout << endl;
+}
+
+void sendFile(int sock, string dest, const string& filename) {
+    // Read file
+    ifstream file(filename, ios::binary | ios::ate);
+    if (!file.is_open()) {
+        cout << "Error: No se pudo abrir el archivo " << filename << endl;
+        return;
+    }
+    
+    // get the length
+    streamsize file_size = file.tellg();
+    file.seekg(0, ios::beg);
+    
+    // Read the content
+    vector<char> file_data(file_size);
+    if (!file.read(file_data.data(), file_size)) {
+        cout << "Error: No se pudo leer el archivo" << endl;
+        return;
+    }
+    file.close();
+    
+    string packet = "f";
+    
+    // nickname
+    uint16_t dlen = htons(dest.size());
+    packet.append((char*)&dlen, 2);
+    packet += dest;
+    
+    // filename
+    uint32_t flen = filename.size();
+    packet.push_back((flen >> 16) & 0xFF);
+    packet.push_back((flen >> 8) & 0xFF);
+    packet.push_back(flen & 0xFF);
+    
+    packet += filename;
+    
+    // file
+    uint64_t fsize = file_size;
+
+    for (int i = 9; i >= 0; i--) {
+        packet.push_back((fsize >> (i * 8)) & 0xFF);
+    }
+    
+    packet.append(file_data.data(), file_size);
+    
+    cout << "Protocol sending: " << formatProtocol(packet.substr(0, 50)) << "..." << endl;
+    send(sock, packet.c_str(), packet.size(), 0);
 }
 
 // Receiver thread
@@ -214,6 +265,71 @@ void receiveMessages(int sock) {
             cout << "Server closed the connection. Goodbye!" << endl;
             break;
         }
+        else if (type=='F') {
+            recv(sock, header, 2, 0);
+            uint16_t slen; memcpy(&slen, header, 2); slen = ntohs(slen);
+            char* sbuf = new char[slen+1];
+            recv(sock, sbuf, slen, 0); sbuf[slen] = '\0';
+            string sender(sbuf);
+            delete[] sbuf;
+
+            recv(sock, header, 3, 0);
+            uint32_t flen = ((unsigned char)header[0] << 16) |
+                        ((unsigned char)header[1] << 8) |
+                        (unsigned char)header[2];
+
+            char* fbuf = new char[flen+1];
+            int bytes_received = 0;
+            while (bytes_received < flen) {
+                int r = recv(sock, fbuf + bytes_received, flen - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+            fbuf[flen] = '\0';
+            string filename(fbuf);
+            delete[] fbuf;
+
+            char size_buf[10];
+            bytes_received = 0;
+            while (bytes_received < 10) {
+                int r = recv(sock, size_buf + bytes_received, 10 - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+            
+            uint64_t fsize = 0;
+            for (int i = 0; i < 10; i++) {
+                fsize = (fsize << 8) | (unsigned char)size_buf[i];
+            }
+
+            char* file_data = new char[fsize];
+            bytes_received = 0;
+            while (bytes_received < fsize) {
+                int r = recv(sock, file_data + bytes_received, fsize - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+            
+            size_t dot_pos = filename.find_last_of(".");
+            string new_filename;
+            if (dot_pos != string::npos) {
+                new_filename = filename.substr(0, dot_pos) + "_dest" + filename.substr(dot_pos);
+            } else {
+                new_filename = filename + "_dest";
+            }
+            
+            ofstream out_file(new_filename, ios::binary);
+            if (out_file.is_open()) {
+                out_file.write(file_data, fsize);
+                out_file.close();
+                cout << "[Archivo recibido de " << sender << "] Guardado como: " << new_filename 
+                    << " (" << fsize << " bytes)" << endl;
+            } else {
+                cout << "[Error] No se pudo guardar el archivo: " << new_filename << endl;
+            }
+            
+            delete[] file_data;
+        }
     }
 }
 
@@ -241,7 +357,8 @@ int main() {
          << "  /all msg   -> broadcast message" << endl
          << "  /to user msg -> private message" << endl
          << "  /list      -> show users" << endl
-         << "  /exit      -> quit" << endl;
+         << "  /exit      -> quit" << endl
+         << "  /file dest file      -> send files" << endl;
 
     string line;
     while (getline(cin,line)) {
@@ -265,8 +382,18 @@ int main() {
         else if (line == "/list") {
             requestList(sock);
         }
+        else if (line.rfind("/file ", 0) == 0) {
+            size_t sp = line.find(' ', 6);
+            if (sp != string::npos && sp + 1 < line.length()) {
+                string dest = line.substr(6, sp - 6);
+                string filename = line.substr(sp + 1);
+                sendFile(sock, dest, filename);
+            } else {
+                cout << "Usage: /file destinatario ruta_del_archivo" << endl;
+            }
+        }
         else {
-            cout << "Unknown command. Available: /all, /to, /list, /exit" << endl;
+            cout << "Unknown command. Available: /all, /to, /list, /exit, /file" << endl;
         }
     }
 
