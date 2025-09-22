@@ -10,6 +10,9 @@
 #include <sstream>
 #include <vector>
 #include <fstream>
+#include "sala.h"
+#include "sala_serialized.h"
+
 
 using namespace std;
 
@@ -164,6 +167,28 @@ void sendFile(int sock, string dest, const string& filename) {
     cout << "Protocol sending: " << formatProtocol(packet.substr(0, 50)) << "..." << endl;
     send(sock, packet.c_str(), packet.size(), 0);
 }
+
+void sendObject(int sock, const string &dest, const Sala &sala) {
+    string packet;
+
+    packet.push_back('o');
+
+    uint16_t dlen = htons(static_cast<uint16_t>(dest.size()));
+    packet.append(reinterpret_cast<char*>(&dlen), sizeof(dlen));
+    packet += dest;
+
+    vector<char> objectContent = serializarSala(sala);
+
+    // 4 bytes
+    uint32_t objSize = htonl(static_cast<uint32_t>(objectContent.size()));
+    packet.append(reinterpret_cast<char*>(&objSize), sizeof(objSize));
+
+    // object content
+    packet.insert(packet.end(), objectContent.begin(), objectContent.end());
+
+    send(sock, packet.data(), packet.size(), 0);
+}
+
 
 // Receiver thread
 void receiveMessages(int sock) {
@@ -330,6 +355,45 @@ void receiveMessages(int sock) {
             
             delete[] file_data;
         }
+        else if (type == 'O') {
+            char header[2];
+            recv(sock, header, 2, 0);
+
+            uint16_t slen;
+            memcpy(&slen, header, 2);
+            slen = ntohs(slen);
+
+            char* sbuf = new char[slen + 1];
+            recv(sock, sbuf, slen, 0);
+            sbuf[slen] = '\0';
+            string sender(sbuf);
+            delete[] sbuf;
+
+            // longitud del objeto
+            char sizeBuf[4];
+            recv(sock, sizeBuf, 4, 0);
+
+            uint32_t objSize;
+            memcpy(&objSize, sizeBuf, 4);
+            objSize = ntohl(objSize);
+
+            // contenido
+            vector<char> objectBuf(objSize);
+            recv(sock, objectBuf.data(), objSize, 0);
+
+            Sala sala = deserializeSala(objectBuf);
+
+            cout << "Objeto Sala recibido de: " << sender << endl;
+            cout << "Silla: " << sala.silla.patas << " patas, " 
+                << (sala.silla.conRespaldo ? "con respaldo" : "sin respaldo") << endl;
+            cout << "Sillón: capacidad " << sala.sillon.capacidad << ", color " << sala.sillon.color << endl;
+            cout << "Cocina: " << (sala.cocina->electrica ? "eléctrica" : "no eléctrica") 
+                << ", " << sala.cocina->metrosCuadrados << " m²" << endl;
+            cout << "n: " << sala.n << endl;
+            cout << "Descripción: " << sala.descripcion << endl;
+
+            delete sala.cocina;
+        }
     }
 }
 
@@ -354,11 +418,12 @@ int main() {
     thread t(receiveMessages,sock);
 
     cout << "Commands:" << endl
-         << "  /all msg   -> broadcast message" << endl
-         << "  /to user msg -> private message" << endl
-         << "  /list      -> show users" << endl
-         << "  /exit      -> quit" << endl
-         << "  /file dest file      -> send files" << endl;
+     << "  /all msg   -> broadcast message" << endl
+     << "  /to user msg -> private message" << endl
+     << "  /list      -> show users" << endl
+     << "  /exit      -> quit" << endl
+     << "  /file dest file -> send files" << endl
+     << "  /object dest -> send Sala object" << endl;
 
     string line;
     while (getline(cin,line)) {
@@ -390,6 +455,31 @@ int main() {
                 sendFile(sock, dest, filename);
             } else {
                 cout << "Usage: /file destinatario ruta_del_archivo" << endl;
+            }
+        }
+        else if (line.rfind("/object ", 0) == 0) {
+            size_t sp = line.find(' ', 8);
+            if (sp != string::npos && sp + 1 < line.length()) {
+                string dest = line.substr(8, sp - 8);
+                
+                // Crear un objeto Sala de ejemplo
+                Sala sala;
+                sala.silla.patas = 4;
+                sala.silla.conRespaldo = true;
+                sala.sillon.capacidad = 3;
+                strcpy(sala.sillon.color, "rojo");
+                sala.cocina = new Cocina();
+                sala.cocina->electrica = true;
+                sala.cocina->metrosCuadrados = 10.5f;
+                sala.n = 42;
+                strcpy(sala.descripcion, "Esta es una sala de ejemplo para prueba");
+                
+                sendObject(sock, dest, sala);
+                
+                // Limpiar memoria
+                delete sala.cocina;
+            } else {
+                cout << "Usage: /object destinatario" << endl;
             }
         }
         else {

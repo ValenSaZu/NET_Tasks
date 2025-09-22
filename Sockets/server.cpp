@@ -11,6 +11,8 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include "sala.h"
+#include "sala_serialized.h"
 
 using namespace std;
 
@@ -153,6 +155,25 @@ string buildFile(const string& sender, const string& filename, const char* file_
     
     // Contenido del archivo
     packet.append(file_data, file_size);
+    
+    return packet;
+}
+
+// Función para construir mensaje de objeto
+string buildObject(const string& sender, const vector<char>& objectData) {
+    string packet = "O";
+    
+    // Remitente
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    
+    // Tamaño del objeto (4 bytes)
+    uint32_t objSize = htonl(static_cast<uint32_t>(objectData.size()));
+    packet.append(reinterpret_cast<const char*>(&objSize), sizeof(objSize));
+    
+    // Contenido del objeto
+    packet.append(objectData.data(), objectData.size());
     
     return packet;
 }
@@ -356,8 +377,62 @@ void handleClient(int client_socket) {
             
             delete[] file_data;
         }
-    }
+        else if (type == 'o') {
+            if (recv(client_socket, header, 2, 0) <= 0) break;
+            uint16_t dlen;
+            memcpy(&dlen, header, 2);
+            dlen = ntohs(dlen);
+            
+            char* dbuf = new char[dlen + 1];
+            int bytes_received = 0;
+            while (bytes_received < dlen) {
+                int r = recv(client_socket, dbuf + bytes_received, dlen - bytes_received, 0);
+                if (r <= 0) { delete[] dbuf; break; }
+                bytes_received += r;
+            }
+            dbuf[dlen] = '\0';
+            string dest(dbuf);
+            delete[] dbuf;
 
+            // Tamaño del objeto (4 bytes)
+            char sizeBuf[4];
+            bytes_received = 0;
+            while (bytes_received < 4) {
+                int r = recv(client_socket, sizeBuf + bytes_received, 4 - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+            
+            uint32_t objSize;
+            memcpy(&objSize, sizeBuf, 4);
+            objSize = ntohl(objSize);
+
+            // Contenido del objeto
+            vector<char> objectData(objSize);
+            bytes_received = 0;
+            while (bytes_received < objSize) {
+                int r = recv(client_socket, objectData.data() + bytes_received, objSize - bytes_received, 0);
+                if (r <= 0) break;
+                bytes_received += r;
+            }
+
+            string objectPacket = "o";
+            uint16_t dlen_net = htons(dlen);
+            objectPacket.append((char*)&dlen_net, 2);
+            objectPacket += dest;
+            objectPacket += string(sizeBuf, 4);
+            cout << nickname << " received object: " << formatProtocol(objectPacket.substr(0, 50)) << "..." << endl;
+
+            if (clients.count(dest)) {
+                string packet = buildObject(nickname, objectData);
+                sendToClient(dest, packet);
+                cout << "Objeto Sala (" << objSize << " bytes) enviado a " << dest << endl;
+            } else {
+                string err = buildError("User " + dest + " not found");
+                sendToClient(nickname, err);
+            }
+        }
+    }
     {
         lock_guard<mutex> lock(clients_mutex);
         clients.erase(nickname);
