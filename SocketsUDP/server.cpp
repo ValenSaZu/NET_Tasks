@@ -56,10 +56,10 @@ string buildClose() {
     return "X"; // Single byte message
 }
 
-string completePacket(string &packet, int maxLengthPacket){
-    uint64_t len = packet.size();
-    for(len ; len<=maxLengthPacket len++){
-        packet += '#';
+string completePacket(string &packet, int maxLengthPacket) {
+    size_t len = packet.size();
+    if (len < (size_t)maxLengthPacket) {
+        packet.append(maxLengthPacket - len, '#');
     }
     return packet;
 }
