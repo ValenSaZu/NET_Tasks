@@ -21,6 +21,8 @@ using namespace std;
 map<string,int> clients;
 mutex clients_mutex;
 
+int lengthPacket = 777;
+
 /*
     n: Nickname (client → server)
     m: Broadcast message (client → server)
@@ -52,6 +54,14 @@ string formatProtocol(const string& data) {
 // Build close connection message
 string buildClose() {
     return "X"; // Single byte message
+}
+
+string completePacket(string &packet, int maxLengthPacket){
+    uint64_t len = packet.size();
+    for(len ; len<=maxLengthPacket len++){
+        packet += '#';
+    }
+    return packet;
 }
 
 // send a message to everyone except who is sending
