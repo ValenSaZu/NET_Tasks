@@ -3,6 +3,11 @@
         "fstream": "cpp",
         "iostream": "cpp",
         "condition_variable": "cpp",
-        "atomic": "cpp"
+        "atomic": "cpp",
+        "deque": "cpp",
+        "string": "cpp",
+        "vector": "cpp",
+        "new": "cpp",
+        "ostream": "cpp"
     }
 }

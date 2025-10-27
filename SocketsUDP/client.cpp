@@ -15,6 +15,7 @@
 #include <mutex>
 #include "sala.h"
 #include "sala_serialized.h"
+#include <map>
 
 using namespace std;
 
@@ -50,6 +51,83 @@ condition_variable ready;
 string userInput;
 bool inputReady = false;
 
+int lengthPacket = 777;
+
+string completePacket(string &packet, int maxLengthPacket) {
+    size_t len = packet.size();
+    if (len < (size_t)maxLengthPacket) {
+        packet.append(maxLengthPacket - len, '#');
+    }
+    return packet;
+}
+
+vector<string> fragmentPackets(const string &header, const string &data, int maxLengthPacket, int sizeFieldBytes) {
+    vector<string> packets;
+
+    size_t overhead = 1 + sizeFieldBytes;
+    size_t maxDataPerPacket = maxLengthPacket - overhead;
+    size_t offset = 0;
+    int numPacket = 1;
+
+    while (offset < data.size()) {
+        size_t remaining = data.size() - offset;
+        size_t chunkSize = min(remaining, maxDataPerPacket);
+        bool isLast = (offset + chunkSize >= data.size());
+
+        string fragment;
+        fragment.push_back(isLast ? 0 : (char)numPacket);
+
+        if (numPacket == 1)
+            fragment += header;
+
+        uint32_t len = (uint32_t)chunkSize;
+        for (int i = sizeFieldBytes - 1; i >= 0; --i)
+            fragment.push_back((len >> (8 * i)) & 0xFF);
+
+        fragment += data.substr(offset, chunkSize);
+
+        if (fragment.size() < (size_t)maxLengthPacket)
+            fragment.append(maxLengthPacket - fragment.size(), '#');
+
+        packets.push_back(fragment);
+        offset += chunkSize;
+        numPacket++;
+    }
+
+    return packets;
+}
+
+struct Fragment{
+    string header;
+    string data;
+};
+
+map<pair<int,char>,Fragment> clientsBuffer;
+mutex fragmentMutex;
+
+bool reconstructPacket(int client, string fragment, string& fullMsg){
+    lock_guard<mutex> lock(fragmentMutex);
+    if (fragment.empty()) return false;
+
+    unsigned char index = fragment[0];
+    char type = fragment[1];
+    pair<int,char> identifier = make_pair(client, type);
+
+    if (!clientsBuffer.count(identifier)) {
+        clientsBuffer[identifier] = Fragment{};
+    }
+
+    clientsBuffer[identifier].data += fragment.substr(1);
+
+    if (index == 0) {
+        fullMsg = clientsBuffer[identifier].data;
+        clientsBuffer.erase(identifier);
+        return true;
+    }
+
+    return false;
+}
+
 // Helper function to print protocol data in hex
 string formatProtocol(const string& data) {
     stringstream ss;
@@ -68,45 +146,44 @@ void sendNickname(int sock, const string nick) {
     uint16_t len = htons(nick.size());
     packet.append((char*)&len,2);
     packet += nick;
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
     send(sock, packet.c_str(), packet.size(), 0);
 }
 
 void sendBroadcast(int sock, const string msg) {
-    string packet = "m";
-    uint32_t len = msg.size();
-    packet.push_back((len>>16)&0xFF);
-    packet.push_back((len>>8)&0xFF);
-    packet.push_back(len&0xFF);
-    packet += msg;
-    cout << "Protocol sending: " << formatProtocol(packet) << endl;
-    send(sock, packet.c_str(), packet.size(), 0);
+    string header = "m";
+    vector<string> packets = fragmentPackets(header, msg, lengthPacket, 3);
+    for(auto packet:packets){
+        cout << "Protocol sending: " << formatProtocol(packet) << endl;
+        send(sock, packet.c_str(), packet.size(), 0);
+    }
 }
 
 void sendToClient(int sock, const string dest, const string msg) {
-    string packet = "t";
+    string header = "t";
     uint16_t dlen = htons(dest.size());
-    packet.append((char*)&dlen,2);
-    packet += dest;
-    uint32_t mlen = msg.size();
-    packet.push_back((mlen>>16)&0xFF);
-    packet.push_back((mlen>>8)&0xFF);
-    packet.push_back(mlen&0xFF);
-    packet += msg;
-    cout << "Protocol sending: " << formatProtocol(packet) << endl;
-    send(sock, packet.c_str(), packet.size(), 0);
+    header.append((char*)&dlen,2);
+    header += dest;
+    vector<string> packets = fragmentPackets(header, msg, lengthPacket, 3);
+    for(auto packet: packets){
+        cout << "Protocol sending: " << formatProtocol(packet) << endl;
+        send(sock, packet.c_str(), packet.size(), 0);
+    }
 }
 
 void requestList(int sock) {
     string packet = "l";
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
-    send(sock, packet.c_str(), 1, 0);
+    send(sock, packet.c_str(), packet.size(), 0);
 }
 
 void sendClose(int sock) {
     string packet = "x";
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
-    send(sock, packet.c_str(), 1, 0);
+    send(sock, packet.c_str(), packet.size(), 0);
 }
 
 // Parse list response
@@ -157,53 +234,47 @@ void sendFile(int sock, string dest, const string& filename) {
     }
     file.close();
     
-    string packet = "f";
+    string header = "f";
     
     // nickname
     uint16_t dlen = htons(dest.size());
-    packet.append((char*)&dlen, 2);
-    packet += dest;
+    header.append((char*)&dlen, 2);
+    header += dest;
     
     // filename
     uint32_t flen = filename.size();
-    packet.push_back((flen >> 16) & 0xFF);
-    packet.push_back((flen >> 8) & 0xFF);
-    packet.push_back(flen & 0xFF);
+    header.push_back((flen >> 16) & 0xFF);
+    header.push_back((flen >> 8) & 0xFF);
+    header.push_back(flen & 0xFF);
     
-    packet += filename;
-    
-    // file
-    uint64_t fsize = file_size;
+    header += filename;
 
-    for (int i = 9; i >= 0; i--) {
-        packet.push_back((fsize >> (i * 8)) & 0xFF);
+    string fileData(file_data.begin(), file_data.end());
+    vector<string> packets = fragmentPackets(header, fileData, lengthPacket, 10);
+    
+    for(auto packet:packets){
+        cout << "Protocol sending: " << formatProtocol(packet.substr(0, 777)) << endl;
+        send(sock, packet.c_str(), packet.size(), 0);
     }
-    
-    packet.append(file_data.data(), file_size);
-    
-    cout << "Protocol sending: " << formatProtocol(packet.substr(0, 50)) << "..." << endl;
-    send(sock, packet.c_str(), packet.size(), 0);
 }
 
 void sendObject(int sock, const string &dest, const Sala &sala) {
-    string packet;
+    string header;
 
-    packet.push_back('o');
+    header.push_back('o');
 
     uint16_t dlen = htons(static_cast<uint16_t>(dest.size()));
-    packet.append(reinterpret_cast<char*>(&dlen), sizeof(dlen));
-    packet += dest;
+    header.append(reinterpret_cast<char*>(&dlen), sizeof(dlen));
+    header += dest;
 
     vector<char> objectContent = serializarSala(sala);
 
-    // 4 bytes
-    uint32_t objSize = htonl(static_cast<uint32_t>(objectContent.size()));
-    packet.append(reinterpret_cast<char*>(&objSize), sizeof(objSize));
+    string object_content(objectContent.begin(), objectContent.end());
 
-    // object content
-    packet.insert(packet.end(), objectContent.begin(), objectContent.end());
-
-    send(sock, packet.data(), packet.size(), 0);
+    vector<string> packets = fragmentPackets(header, object_content, lengthPacket, 4);
+    for(auto packet: packets){
+        send(sock, packet.data(), packet.size(), 0);
+    }
 }
 
 void sendGameRequest(int sock, const string& dest) {
@@ -211,6 +282,7 @@ void sendGameRequest(int sock, const string& dest) {
     uint16_t dlen = htons(dest.size());
     packet.append((char*)&dlen, 2);
     packet += dest;
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
     send(sock, packet.c_str(), packet.size(), 0);
 }
@@ -221,6 +293,7 @@ void sendGameResponse(int sock, const string& sender, bool accept) {
     packet.append((char*)&slen, 2);
     packet += sender;
     packet.push_back(accept ? 'y' : 'n');
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
     send(sock, packet.c_str(), packet.size(), 0);
 }
@@ -232,6 +305,7 @@ void sendBoardPosition(int sock, int position) {
     packet.push_back((pos >> 16) & 0xFF);
     packet.push_back((pos >> 8) & 0xFF);
     packet.push_back(pos & 0xFF);
+    packet = completePacket(packet, lengthPacket);
     cout << "Protocol sending: " << formatProtocol(packet) << endl;
     send(sock, packet.c_str(), packet.size(), 0);
 }
@@ -301,332 +375,225 @@ string getBoardInput(const string& prompt) {
 void receiveMessages(int sock, const string& nickname) {
     char header[4];
     while (true) {
-        int r = recv(sock, header, 1, 0);
+        char buffer[777];
+
+        int r = recv(sock, buffer, 777, 0);
         if (r<=0) { cout << "Disconnected." << endl; break; }
-        char type = header[0];
+        string fragment(buffer,r);
+        string completePacket;
 
-        if (type=='E') {
-            recv(sock, header, 3, 0);
-            int len = ((unsigned char)header[0] << 16) |
-                    ((unsigned char)header[1] << 8) |
-                    (unsigned char)header[2];
-            char* buf = new char[len+1];
-            recv(sock, buf, len, 0);
-            buf[len]='\0';
-            
-            string errorPacket = "E";
-            errorPacket += string(header, 3);
-            errorPacket += string(buf, len);
-            cout << "Protocol received: " << formatProtocol(errorPacket) << endl;
-            
-            cout << "[Error] " << buf << endl;
-            delete[] buf;
-            break;
-        }
-        else if (type=='M') {
-            // read sender
-            recv(sock, header, 2, 0);
-            uint16_t slen; memcpy(&slen, header, 2); slen = ntohs(slen);
-            char* sbuf = new char[slen+1];
-            recv(sock, sbuf, slen, 0); sbuf[slen] = '\0';
-            string sender(sbuf);
-            delete[] sbuf;
+        if(reconstructPacket(sock, fragment, completePacket)){
+            char type = completePacket[0];
 
-            // read message
-            recv(sock, header, 3, 0);
-            int mlen = ((unsigned char)header[0]<<16) |
-                    ((unsigned char)header[1]<<8)  |
-                    (unsigned char)header[2];
-            char* mbuf = new char[mlen+1];
-            recv(sock, mbuf, mlen, 0); mbuf[mlen] = '\0';
-
-            string broadcastPacket = "M";
-            uint16_t slen_net = htons(slen);
-            broadcastPacket.append((char*)&slen_net, 2);
-            broadcastPacket += sender;
-            broadcastPacket += string(header, 3);
-            broadcastPacket += string(mbuf, mlen);
-            cout << "Protocol received: " << formatProtocol(broadcastPacket) << endl;
-
-            cout << "[Broadcast from " << sender << "] " << mbuf << endl;
-            delete[] mbuf;
-        }
-        else if (type=='T') {
-            recv(sock, header,2,0);
-            uint16_t slen; memcpy(&slen,header,2); slen=ntohs(slen);
-            char* sbuf=new char[slen+1];
-            recv(sock,sbuf,slen,0); sbuf[slen]='\0';
-            string sender(sbuf);
-            delete[] sbuf;
-
-            recv(sock,header,3,0);
-            int mlen = ((unsigned char)header[0]<<16)|
-                       ((unsigned char)header[1]<<8)|
-                       (unsigned char)header[2];
-            char* mbuf=new char[mlen+1];
-            recv(sock,mbuf,mlen,0); mbuf[mlen]='\0';
-            
-            string privatePacket = "T";
-            uint16_t slen_net = htons(slen);
-            privatePacket.append((char*)&slen_net, 2);
-            privatePacket += sender;
-            privatePacket += string(header, 3);
-            privatePacket += string(mbuf, mlen);
-            cout << "Protocol received: " << formatProtocol(privatePacket) << endl;
-            
-            cout << "[Private from " << sender << "] " << mbuf << endl;
-            delete[] mbuf;
-        }
-        else if (type=='L') {
-            recv(sock, header,2,0);
-            uint16_t total_len; memcpy(&total_len,header,2); total_len=ntohs(total_len);
-            char* buf=new char[total_len+1];
-            recv(sock,buf,total_len,0); buf[total_len]='\0';
-            
-            string listPacket = "L";
-            uint16_t total_len_net = htons(total_len);
-            listPacket.append((char*)&total_len_net, 2);
-            listPacket += string(buf, total_len);
-            cout << "Protocol received: " << formatProtocol(listPacket) << endl;
-            
-            parseListResponse(buf, total_len);
-            delete[] buf;
-        }
-        else if (type=='X') {
-            cout << "Protocol received: X" << endl;
-            cout << "Server closed the connection. Goodbye!" << endl;
-            break;
-        }
-        else if (type=='F') {
-            recv(sock, header, 2, 0);
-            uint16_t slen; memcpy(&slen, header, 2); slen = ntohs(slen);
-            char* sbuf = new char[slen+1];
-            recv(sock, sbuf, slen, 0); sbuf[slen] = '\0';
-            string sender(sbuf);
-            delete[] sbuf;
-
-            recv(sock, header, 3, 0);
-            uint32_t flen = ((unsigned char)header[0] << 16) |
+            if (type=='E') {
+                recv(sock, header, 3, 0);
+                int len = ((unsigned char)header[0] << 16) |
                         ((unsigned char)header[1] << 8) |
                         (unsigned char)header[2];
-
-            char* fbuf = new char[flen+1];
-            int bytes_received = 0;
-            while (bytes_received < flen) {
-                int r = recv(sock, fbuf + bytes_received, flen - bytes_received, 0);
-                if (r <= 0) break;
-                bytes_received += r;
-            }
-            fbuf[flen] = '\0';
-            string filename(fbuf);
-            delete[] fbuf;
-
-            char size_buf[10];
-            bytes_received = 0;
-            while (bytes_received < 10) {
-                int r = recv(sock, size_buf + bytes_received, 10 - bytes_received, 0);
-                if (r <= 0) break;
-                bytes_received += r;
-            }
-            
-            uint64_t fsize = 0;
-            for (int i = 0; i < 10; i++) {
-                fsize = (fsize << 8) | (unsigned char)size_buf[i];
-            }
-
-            char* file_data = new char[fsize];
-            bytes_received = 0;
-            while (bytes_received < fsize) {
-                int r = recv(sock, file_data + bytes_received, fsize - bytes_received, 0);
-                if (r <= 0) break;
-                bytes_received += r;
-            }
-            
-            size_t dot_pos = filename.find_last_of(".");
-            string new_filename;
-            if (dot_pos != string::npos) {
-                new_filename = filename.substr(0, dot_pos) + "_dest" + filename.substr(dot_pos);
-            } else {
-                new_filename = filename + "_dest";
-            }
-            
-            ofstream out_file(new_filename, ios::binary);
-            if (out_file.is_open()) {
-                out_file.write(file_data, fsize);
-                out_file.close();
-                cout << "[File received from " << sender << "] Saved as: " << new_filename 
-                    << " (" << fsize << " bytes)" << endl;
-            } else {
-                cout << "[Error] Could not save file: " << new_filename << endl;
-            }
-            
-            delete[] file_data;
-        }
-        else if (type == 'O') {
-            char header[2];
-            recv(sock, header, 2, 0);
-
-            uint16_t slen;
-            memcpy(&slen, header, 2);
-            slen = ntohs(slen);
-
-            char* sbuf = new char[slen + 1];
-            recv(sock, sbuf, slen, 0);
-            sbuf[slen] = '\0';
-            string sender(sbuf);
-            delete[] sbuf;
-
-            // object length
-            char sizeBuf[4];
-            recv(sock, sizeBuf, 4, 0);
-
-            uint32_t objSize;
-            memcpy(&objSize, sizeBuf, 4);
-            objSize = ntohl(objSize);
-
-            // content
-            vector<char> objectBuf(objSize);
-            recv(sock, objectBuf.data(), objSize, 0);
-
-            Sala sala = deserializeSala(objectBuf);
-
-            cout << "Sala object received from: " << sender << endl;
-            cout << "Chair: " << sala.silla.patas << " legs, " 
-                << (sala.silla.conRespaldo ? "with backrest" : "without backrest") << endl;
-            cout << "Sofa: capacity " << sala.sillon.capacidad << ", color " << sala.sillon.color << endl;
-            cout << "Kitchen: " << (sala.cocina->electrica ? "electric" : "non-electric") 
-                << ", " << sala.cocina->metrosCuadrados << " m²" << endl;
-            cout << "n: " << sala.n << endl;
-            cout << "Description: " << sala.descripcion << endl;
-
-            delete sala.cocina;
-        }
-        else if (type == 'J') {
-            // Game request
-            recv(sock, header, 2, 0);
-            uint16_t slen;
-            memcpy(&slen, header, 2);
-            slen = ntohs(slen);
-            
-            char* sbuf = new char[slen + 1];
-            recv(sock, sbuf, slen, 0);
-            sbuf[slen] = '\0';
-            string sender(sbuf);
-            delete[] sbuf;
-            
-            string gameRequestPacket = "J";
-            uint16_t slen_net = htons(slen);
-            gameRequestPacket.append((char*)&slen_net, 2);
-            gameRequestPacket += sender;
-            cout << "Protocol received: " << formatProtocol(gameRequestPacket) << endl;
-            
-            // Get game response from user
-            string response = getGameInput(sender + " is inviting you to play Tic Tac Toe\nDo you accept? (y/n): ");
-            bool accept = (response == "y" || response == "Y" || response == "s" || response == "S");
-            sendGameResponse(sock, sender, accept);
-            
-            if (accept) {
-                cout << "Starting game with " << sender << "..." << endl;
-            } else {
-                cout << "Invitation declined." << endl;
-            }
-        }
-        else if (type == 'j') {
-            // Game response
-            recv(sock, header, 2, 0);
-            uint16_t slen;
-            memcpy(&slen, header, 2);
-            slen = ntohs(slen);
-            
-            char* sbuf = new char[slen + 1];
-            recv(sock, sbuf, slen, 0);
-            sbuf[slen] = '\0';
-            string sender(sbuf);
-            delete[] sbuf;
-            
-            char response;
-            recv(sock, &response, 1, 0);
-            
-            string gameResponsePacket = "j";
-            uint16_t slen_net = htons(slen);
-            gameResponsePacket.append((char*)&slen_net, 2);
-            gameResponsePacket += sender;
-            gameResponsePacket += response;
-            cout << "Protocol received: " << formatProtocol(gameResponsePacket) << endl;
-            
-            if (response == 'y') {
-                cout << sender << " accepted your game invitation!" << endl;
-            } else {
-                cout << sender << " declined your game invitation." << endl;
-            }
-        }
-        else if (type == 'B') {
-            // Board state
-            recv(sock, header, 2, 0);
-            uint16_t board_len;
-            memcpy(&board_len, header, 2);
-            board_len = ntohs(board_len);
-            
-            vector<char> board(board_len);
-            recv(sock, board.data(), board_len, 0);
-            
-            recv(sock, header, 2, 0);
-            uint16_t player_len;
-            memcpy(&player_len, header, 2);
-            player_len = ntohs(player_len);
-            
-            char* player_buf = new char[player_len + 1];
-            recv(sock, player_buf, player_len, 0);
-            player_buf[player_len] = '\0';
-            string currentPlayer(player_buf);
-            delete[] player_buf;
-            
-            string boardPacket = "B";
-            uint16_t board_len_net = htons(board_len);
-            boardPacket.append((char*)&board_len_net, 2);
-            boardPacket += string(board.begin(), board.end());
-            uint16_t player_len_net = htons(player_len);
-            boardPacket.append((char*)&player_len_net, 2);
-            boardPacket += currentPlayer;
-            cout << "Protocol received: " << formatProtocol(boardPacket) << endl;
-            
-            cout << "Current board:" << endl;
-            printBoard(board, currentPlayer, nickname);
-
-            if (currentPlayer == nickname) {
-                string move = getBoardInput("Select a position (0-8): ");
+                char* buf = new char[len+1];
+                recv(sock, buf, len, 0);
+                buf[len]='\0';
                 
-                try {
-                    int position = stoi(move);
-                    if (position >= 0 && position <= 8) {
-                        sendBoardPosition(sock, position);
-                    } else {
-                        cout << "Invalid position. Must be between 0 and 8." << endl;
-                    }
-                } catch (...) {
-                    cout << "Invalid input." << endl;
-                }
-            } else {
-                cout << "Please wait for " << currentPlayer << " to make a move..." << endl;
+                string errorPacket = "E";
+                errorPacket += string(header, 3);
+                errorPacket += string(buf, len);
+                cout << "Protocol received: " << formatProtocol(errorPacket) << endl;
+                
+                cout << "[Error] " << buf << endl;
+                delete[] buf;
+                break;
             }
-        }
-        else if (type == 'W') {
-            // Game result
-            recv(sock, header, 1, 0);
-            char result = header[0];
-            
-            string resultPacket = "W";
-            resultPacket += result;
-            cout << "Protocol received: " << formatProtocol(resultPacket) << endl;
-            
-            if (result == '1') {
-                cout << "You win!" << endl;
-            } else if (result == '0') {
-                cout << "You lose!" << endl;
-            } else if (result == '2') {
-                cout << "It's a tie!" << endl;
-            } else if (result == '3') {
-                cout << "Game ended: opponent disconnected" << endl;
+            else if (type=='M') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+
+                int mlen = ((unsigned char)completePacket[3 + slen] << 16) |
+                        ((unsigned char)completePacket[3 + slen + 1] << 8) |
+                        (unsigned char)completePacket[3 + slen + 2];
+
+                string msg = completePacket.substr(3 + slen + 3, mlen);
+
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+                cout << "[Broadcast from " << sender << "] " << msg << endl;
+            }
+            else if (type=='T') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+
+                int mlen = ((unsigned char)completePacket[3 + slen] << 16) |
+                        ((unsigned char)completePacket[3 + slen + 1] << 8) |
+                        (unsigned char)completePacket[3 + slen + 2];
+
+                string msg = completePacket.substr(3 + slen + 3, mlen);
+
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+                cout << "[Private from " << sender << "] " << msg << endl;
+            }
+            else if (type=='L') {
+                uint16_t total_len;
+                memcpy(&total_len, &completePacket[1], 2);
+                total_len = ntohs(total_len);
+
+                string listData = completePacket.substr(3, total_len);
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+
+                parseListResponse((char*)listData.data(), total_len);
+            }
+            else if (type=='X') {
+                cout << "Protocol received: X" << endl;
+                cout << "Server closed the connection. Goodbye!" << endl;
+                break;
+            }
+            else if (type=='F') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+
+                int flen = ((unsigned char)completePacket[3 + slen] << 16) |
+                        ((unsigned char)completePacket[3 + slen + 1] << 8) |
+                        (unsigned char)completePacket[3 + slen + 2];
+
+                string filename = completePacket.substr(3 + slen + 3, flen);
+
+                uint64_t fsize = 0;
+                for (int i = 0; i < 10; i++) {
+                    fsize = (fsize << 8) | (unsigned char)completePacket[3 + slen + 3 + flen + i];
+                }
+
+                string fileData = completePacket.substr(3 + slen + 3 + flen + 10);
+                cout << "Protocol received: " << formatProtocol(completePacket)<< endl;
+
+                size_t dot_pos = filename.find_last_of(".");
+                string new_filename = (dot_pos != string::npos)
+                    ? filename.substr(0, dot_pos) + "_dest" + filename.substr(dot_pos)
+                    : filename + "_dest";
+
+                ofstream out_file(new_filename, ios::binary);
+                if (out_file.is_open()) {
+                    out_file.write(fileData.c_str(), fsize);
+                    out_file.close();
+                    cout << "[File received from " << sender << "] Saved as: "
+                        << new_filename << " (" << fsize << " bytes)" << endl;
+                } else {
+                    cout << "[Error] Could not save file: " << new_filename << endl;
+                }
+            }
+            else if (type == 'O') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+
+                uint32_t objSize;
+                memcpy(&objSize, &completePacket[3 + slen], 4);
+                objSize = ntohl(objSize);
+
+                vector<char> objectBuf(objSize);
+                memcpy(objectBuf.data(), &completePacket[3 + slen + 4], objSize);
+
+                Sala sala = deserializeSala(objectBuf);
+
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+
+                cout << "Sala object received from: " << sender << endl;
+                cout << "Chair: " << sala.silla.patas << " legs, "
+                    << (sala.silla.conRespaldo ? "with backrest" : "without backrest") << endl;
+                cout << "Sofa: capacity " << sala.sillon.capacidad << ", color " << sala.sillon.color << endl;
+                cout << "Kitchen: " << (sala.cocina->electrica ? "electric" : "non-electric")
+                    << ", " << sala.cocina->metrosCuadrados << " m²" << endl;
+                cout << "n: " << sala.n << endl;
+                cout << "Description: " << sala.descripcion << endl;
+
+                delete sala.cocina;
+            }
+            else if (type == 'J') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+                cout << "[Game request from " << sender << "]\n";
+
+                string response = getGameInput(sender + " is inviting you to play Tic Tac Toe\nDo you accept? (y/n): ");
+                bool accept = (response == "y" || response == "Y" || response == "s" || response == "S");
+                sendGameResponse(sock, sender, accept);
+
+                if (accept) {
+                    cout << "Starting game with " << sender << "..." << endl;
+                } else {
+                    cout << "Invitation declined." << endl;
+                }
+            }
+            else if (type == 'j') {
+                uint16_t slen;
+                memcpy(&slen, &completePacket[1], 2);
+                slen = ntohs(slen);
+
+                string sender = completePacket.substr(3, slen);
+                char response = completePacket[3 + slen];
+
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+
+                if (response == 'y')
+                    cout << "[Game accepted by " << sender << "]\n";
+                else
+                    cout << "[Game rejected by " << sender << "]\n";
+            }
+            else if (type == 'B') {
+                uint16_t board_len;
+                memcpy(&board_len, &completePacket[1], 2);
+                board_len = ntohs(board_len);
+
+                vector<char> board(board_len);
+                memcpy(board.data(), &completePacket[3], board_len);
+
+                uint16_t player_len;
+                memcpy(&player_len, &completePacket[3 + board_len], 2);
+                player_len = ntohs(player_len);
+
+                string currentPlayer = completePacket.substr(3 + board_len + 2, player_len);
+
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+
+                if (currentPlayer == nickname) {
+                    string move = getBoardInput("Select a position (0-8): ");
+                    
+                    try {
+                        int position = stoi(move);
+                        if (position >= 0 && position <= 8) {
+                            sendBoardPosition(sock, position);
+                        } else {
+                            cout << "Invalid position. Must be between 0 and 8." << endl;
+                        }
+                    } catch (...) {
+                        cout << "Invalid input." << endl;
+                    }
+                } else {
+                    cout << "Please wait for " << currentPlayer << " to make a move..." << endl;
+                }
+            }
+            else if (type == 'W') {
+                char result = completePacket[1];
+                cout << "Protocol received: " << formatProtocol(completePacket) << endl;
+                if (result == '1') {
+                    cout << "You win!" << endl;
+                } else if (result == '0') {
+                    cout << "You lose!" << endl;
+                } else if (result == '2') {
+                    cout << "It's a tie!" << endl;
+                } else if (result == '3') {
+                    cout << "Game ended: opponent disconnected" << endl;
+                }
             }
         }
     }
