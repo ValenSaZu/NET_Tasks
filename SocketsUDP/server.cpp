@@ -11,223 +11,39 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 #include "sala.h"
 #include "sala_serialized.h"
+#include <vector>
+#include <algorithm>
 
 using namespace std;
 
 #define PORT 45000
+#define MAX_DATAGRAM_SIZE 1024
 
-map<string,int> clients;
+int maxDatagramLength = 777;
+
+struct ClientInfo {
+    int socket_fd;
+    sockaddr_in address;
+    socklen_t addr_len;
+};
+map<string, ClientInfo> clients;
 mutex clients_mutex;
 
-int lengthPacket = 777;
-
-/*
-    n: Nickname (client → server)
-    m: Broadcast message (client → server)
-    t: Private message (client → server)
-    l: List of clients (client → server)
-    x: Close connection (client → server)
-    f: Send files (client → server)
-    E: Error (server → client)
-    M: Broadcast message (server → client)
-    T: Private message (server → client)
-    L: List of clients (server → client)
-    X: Close connection (server → client)
-    F: Send files (server → client)
-*/
-
-// Helper function to print protocol data in hex
-string formatProtocol(const string& data) {
-    stringstream ss;
-    for (char c : data) {
-        if (isprint(c) && c != ' ') {
-            ss << c;
-        } else {
-            ss << "\\x" << hex << setw(2) << setfill('0') << (int)(unsigned char)c;
-        }
-    }
-    return ss.str();
-}
-
-string completePacket(string &packet, int maxLengthPacket) {
-    size_t len = packet.size();
-    if (len < (size_t)maxLengthPacket) {
-        packet.append(maxLengthPacket - len, '#');
-    }
-    return packet;
-}
-
-vector<string> fragmentPackets(const string &header, const string &data, int maxLengthPacket, int sizeFieldBytes) {
-    vector<string> packets;
-
-    size_t overhead = 1 + sizeFieldBytes;
-    size_t maxDataPerPacket = maxLengthPacket - overhead;
-    size_t offset = 0;
-    int numPacket = 1;
-
-    while (offset < data.size()) {
-        size_t remaining = data.size() - offset;
-        size_t chunkSize = min(remaining, maxDataPerPacket);
-        bool isLast = (offset + chunkSize >= data.size());
-
-        string fragment;
-        fragment.push_back(isLast ? 0 : (char)numPacket);
-
-        if (numPacket == 1)
-            fragment += header;
-
-        uint32_t len = (uint32_t)chunkSize;
-        for (int i = sizeFieldBytes - 1; i >= 0; --i)
-            fragment.push_back((len >> (8 * i)) & 0xFF);
-
-        fragment += data.substr(offset, chunkSize);
-
-        if (fragment.size() < (size_t)maxLengthPacket)
-            fragment.append(maxLengthPacket - fragment.size(), '#');
-
-        packets.push_back(fragment);
-        offset += chunkSize;
-        numPacket++;
-    }
-
-    return packets;
-}
-
-struct Fragment{
-    string header;
-    string data;
+// Estructura para reconstrucción de paquetes fragmentados
+struct FragmentReassembly {
+    vector<string> fragments;
+    string fullData;
+    char messageType;
+    size_t totalSize;
+    size_t receivedSize;
+    time_t lastFragmentTime;
 };
 
-map<pair<int,char>,Fragment> clientsBuffer;
-mutex fragmentMutex;
-
-bool reconstructPacket(int client, string fragment, string& fullMsg){
-    lock_guard<mutex> lock(fragmentMutex);
-    if (fragment.empty()) return false;
-
-    unsigned char index = fragment[0];
-    char type = fragment[1];
-    pair<int,char> identifier = make_pair(client, type);
-
-    if (!clientsBuffer.count(identifier)) {
-        clientsBuffer[identifier] = Fragment{};
-    }
-
-    clientsBuffer[identifier].data += fragment.substr(1);
-
-    if (index == 0) {
-        fullMsg = clientsBuffer[identifier].data;
-        clientsBuffer.erase(identifier);
-        return true;
-    }
-
-    return false;
-}
-
-// send a message to everyone except who is sending
-void sendAll(const string data, int sender_client = -1) {
-    lock_guard<mutex> lock(clients_mutex);
-    for (auto client : clients) {
-        if (client.second != sender_client) {
-            cout << "Server sending to " << client.first << ": " << formatProtocol(data) << endl;
-            send(client.second, data.c_str(), data.size(), 0);
-        }
-    }
-}
-
-// send a message to a specific client
-void sendToClient(const string dest, const string data) {
-    lock_guard<mutex> lock(clients_mutex);
-    if (clients.count(dest)) {
-        cout << "Server sending to " << dest << ": " << formatProtocol(data) << endl;
-        send(clients[dest], data.c_str(), data.size(), 0);
-    }
-}
-
-// Build the error message with the protocol
-vector<string> buildError(const string& msg) {
-    string packet = "E";
-    uint32_t len = msg.size();
-    vector<string> packets = fragmentPackets(packet, msg, lengthPacket, 3);
-    return packets;
-}
-
-// Build the message with the protocol
-vector<string> buildBroadcast(const string& sender, const string& msg) {
-    string packet = "M";
-    uint16_t slen = htons(sender.size());
-    packet.append((char*)&slen, 2);
-    packet += sender;
-    vector<string> packets = fragmentPackets(packet, msg, lengthPacket, 3);
-    return packets;
-}
-
-// Build the message to a specific client with the protocol
-vector<string> buildToClient(const string& sender, const string& msg) {
-    string packet = "T";
-    uint16_t slen = htons(sender.size());
-    packet.append((char*)&slen, 2);
-    packet += sender;
-    vector<string> packets = fragmentPackets(packet, msg, lengthPacket, 3);
-    return packets;
-}
-
-//Build list with the protocol
-string buildList() {
-    lock_guard<mutex> lock(clients_mutex);
-    string all;
-    for (auto client : clients) {
-        uint16_t nick_len = htons(client.first.size());
-        all.append((char*)&nick_len, 2);
-        all += client.first;
-    }
-    
-    string packet = "L";
-    uint16_t total_len = htons(all.size());
-    packet.append((char*)&total_len, 2);
-    packet += all;
-    packet = completePacket(packet, lengthPacket);
-    return packet;
-}
-
-// Function to build file message
-vector<string> buildFile(const string& sender, const string& filename, const char* file_data, uint64_t file_size, int lengthPacket) {
-    vector<string> packets;
-    string header = "F";
-    
-    uint16_t slen = htons(sender.size());
-    header.append((char*)&slen, 2);
-    header += sender;
-    
-    uint32_t flen = filename.size();
-    header.push_back((flen >> 16) & 0xFF);
-    header.push_back((flen >> 8) & 0xFF);
-    header.push_back(flen & 0xFF);
-    
-    header += filename;
-
-    string fileDataStr(file_data, file_data + file_size);
-    packets = fragmentPackets(header, fileDataStr, lengthPacket, 10);
-    
-    return packets;
-}
-
-// Function to build object message
-vector<string> buildObject(const string& sender, const vector<char>& objectData) {
-    string header = "O";
-    
-    // Sender
-    uint16_t slen = htons(sender.size());
-    header.append((char*)&slen, 2);
-    header += sender;
-    
-    string ObjectData(objectData.begin(), objectData.end());
-    vector<string> packets = fragmentPackets(header, ObjectData, lengthPacket, 4);
-    
-    return packets;
-}
+unordered_map<string, FragmentReassembly> reassemblyBuffers;
+mutex reassembly_mutex;
 
 struct Game {
     string player1;
@@ -240,27 +56,728 @@ struct Game {
 map<pair<string, string>, Game> activeGames;
 mutex games_mutex;
 
-string buildGameRequest(const string& sender) {
+// Declaraciones de funciones
+vector<string> buildBroadcast(const string& sender, const string& msg);
+vector<string> buildToClient(const string& sender, const string& msg);
+vector<string> buildFile(const string& sender, const string& filename, const char* file_data, uint64_t file_size);
+vector<string> buildObject(const string& sender, const vector<char>& objectData);
+vector<string> buildGameRequest(const string& sender);
+vector<string> buildGameResponse(const string& sender, bool accepted);
+vector<string> buildBoard(const vector<char>& board, const string& currentPlayer);
+vector<string> buildGameResult(char result);
+vector<string> buildError(const string& msg);
+vector<string> buildList();
+vector<string> buildClose();
+
+void sendAll(const vector<string> packets, const string& sender_nickname);
+void sendToClient(const string dest, const vector<string> packets);
+void initializeGame(Game& game, const string& p1, const string& p2);
+void processGameMove(const string& player, uint32_t position);
+void processCompleteMessage(const string& client_nickname, const string& fullData, char messageType, 
+                           const sockaddr_in& client_addr, socklen_t addr_len, int server_fd);
+
+string completeDatagram(string &packet) {
+    size_t len = packet.size();
+    if (len < (size_t)maxDatagramLength) {
+        packet.append(maxDatagramLength - len, '#');
+    }
+    return packet;
+}
+
+vector<string> fragmentDatagram(const string &header, const string &data, int sizeFieldBytes) {
+    vector<string> datagrams;
+
+    size_t overhead = 1 + header.size() + sizeFieldBytes;
+    size_t maxDataPerPacket = maxDatagramLength - overhead;
+    size_t offset = 0;
+    int numPacket = 1;
+    int totalPackets = (data.size() + maxDataPerPacket - 1) / maxDataPerPacket;
+
+    while (offset < data.size()) {
+        size_t remaining = data.size() - offset;
+        size_t chunkSize = min(remaining, maxDataPerPacket);
+        bool isLast = (offset + chunkSize >= data.size());
+
+        string fragment;
+        fragment.push_back(isLast ? 0 : (char)numPacket);
+
+        fragment += header;
+
+        uint32_t len = (uint32_t)chunkSize;
+        for (int i = sizeFieldBytes - 1; i >= 0; --i)
+            fragment.push_back((len >> (8 * i)) & 0xFF);
+
+        fragment += data.substr(offset, chunkSize);
+
+        if (fragment.size() < (size_t)maxDatagramLength)
+            fragment = completeDatagram(fragment);
+
+        datagrams.push_back(fragment);
+        offset += chunkSize;
+        numPacket++;
+    }
+
+    return datagrams;
+}
+
+// Función para reconstruir paquetes fragmentados
+bool reconstructPacket(const string& client_id, const string& fragment, string& fullData, char& messageType) {
+    lock_guard<mutex> lock(reassembly_mutex);
+    
+    if (fragment.empty()) {
+        return false;
+    }
+
+    char fragmentNum = fragment[0];
+    
+    // Si es un fragmento (número 1-9) o último fragmento (0)
+    if (fragmentNum >= 0 && fragmentNum <= 9) {
+        // El tipo de mensaje está en el segundo byte
+        if (fragment.size() > 1) {
+            messageType = fragment[1];
+        } else {
+            return false;
+        }
+
+        if (fragmentNum != 0) {
+            // Fragmento intermedio
+            if (reassemblyBuffers.find(client_id) == reassemblyBuffers.end()) {
+                FragmentReassembly reassembly;
+                reassembly.fragments.push_back(fragment);
+                reassembly.messageType = messageType;
+                reassembly.lastFragmentTime = time(nullptr);
+                reassemblyBuffers[client_id] = reassembly;
+            } else {
+                reassemblyBuffers[client_id].fragments.push_back(fragment);
+                reassemblyBuffers[client_id].lastFragmentTime = time(nullptr);
+            }
+            return false;
+        } else {
+            // Último fragmento
+            if (reassemblyBuffers.find(client_id) != reassemblyBuffers.end()) {
+                auto& reassembly = reassemblyBuffers[client_id];
+                reassembly.fragments.push_back(fragment);
+                
+                // Reconstruir en orden (no necesitamos ordenar si llegan en orden)
+                for (const auto& frag : reassembly.fragments) {
+                    // Saltar el byte de número de fragmento y agregar el resto
+                    fullData += frag.substr(1);
+                }
+                
+                messageType = reassembly.messageType;
+                reassemblyBuffers.erase(client_id);
+                return true;
+            } else {
+                // Si es el único fragmento (mensaje pequeño)
+                fullData = fragment.substr(1);
+                return true;
+            }
+        }
+    } else {
+        // No es un fragmento, es mensaje simple
+        fullData = fragment;
+        messageType = fragment[0];
+        return true;
+    }
+}
+
+// Función separada para procesar mensajes de nickname
+void processNicknameMessage(int server_fd, const string& data, const sockaddr_in& client_addr, socklen_t addr_len) {
+    size_t offset = 1;
+    if (data.size() < offset + 2) return;
+    
+    uint16_t nlen;
+    memcpy(&nlen, data.c_str() + offset, 2);
+    nlen = ntohs(nlen);
+    offset += 2;
+    
+    if (data.size() < offset + nlen) return;
+    string nickname(data.c_str() + offset, nlen);
+    
+    {
+        lock_guard<mutex> lock(clients_mutex);
+        if (clients.count(nickname)) {
+            vector<string> err = buildError("Nickname already taken");
+            for (const auto& packet : err) {
+                sendto(server_fd, packet.c_str(), packet.size(), 0, (struct sockaddr*)&client_addr, addr_len);
+            }
+            return;
+        }
+        ClientInfo info = {server_fd, client_addr, addr_len};
+        clients[nickname] = info;
+        cout << nickname << " connected" << endl;
+    }
+}
+
+// Función para procesar mensajes completos (simples o reconstruidos)
+void processCompleteMessage(const string& client_nickname, const string& fullData, char messageType, 
+                           const sockaddr_in& client_addr, socklen_t addr_len, int server_fd) {
+    
+    size_t offset = 0;
+    
+    switch (messageType) {
+        case 'm': { // Broadcast message
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 3) return;
+            uint32_t mlen = ((unsigned char)fullData[offset] << 16) |
+                           ((unsigned char)fullData[offset+1] << 8) |
+                           (unsigned char)fullData[offset+2];
+            offset += 3;
+            
+            if (fullData.size() < offset + mlen) return;
+            string message(fullData.c_str() + offset, mlen);
+            
+            cout << sender << " sent broadcast: " << message << endl;
+            vector<string> packets = buildBroadcast(sender, message);
+            sendAll(packets, sender);
+            break;
+        }
+        
+        case 't': { // Private message
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 2) return;
+            uint16_t dlen;
+            memcpy(&dlen, fullData.c_str() + offset, 2);
+            dlen = ntohs(dlen);
+            offset += 2;
+            
+            if (fullData.size() < offset + dlen) return;
+            string dest(fullData.c_str() + offset, dlen);
+            offset += dlen;
+            
+            if (fullData.size() < offset + 3) return;
+            uint32_t mlen = ((unsigned char)fullData[offset] << 16) |
+                           ((unsigned char)fullData[offset+1] << 8) |
+                           (unsigned char)fullData[offset+2];
+            offset += 3;
+            
+            if (fullData.size() < offset + mlen) return;
+            string message(fullData.c_str() + offset, mlen);
+            
+            cout << sender << " sent private to " << dest << ": " << message << endl;
+            vector<string> packets = buildToClient(sender, message);
+            sendToClient(dest, packets);
+            break;
+        }
+        
+        case 'f': { // File transfer
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 2) return;
+            uint16_t dlen;
+            memcpy(&dlen, fullData.c_str() + offset, 2);
+            dlen = ntohs(dlen);
+            offset += 2;
+            
+            if (fullData.size() < offset + dlen) return;
+            string dest(fullData.c_str() + offset, dlen);
+            offset += dlen;
+            
+            if (fullData.size() < offset + 3) return;
+            uint32_t flen = ((unsigned char)fullData[offset] << 16) |
+                           ((unsigned char)fullData[offset+1] << 8) |
+                           (unsigned char)fullData[offset+2];
+            offset += 3;
+            
+            if (fullData.size() < offset + flen) return;
+            string filename(fullData.c_str() + offset, flen);
+            offset += flen;
+            
+            if (fullData.size() < offset + 10) return;
+            uint64_t file_size = 0;
+            for (int i = 0; i < 10; i++) {
+                file_size = (file_size << 8) | (unsigned char)fullData[offset++];
+            }
+            
+            if (fullData.size() < offset + file_size) return;
+            vector<char> file_data(fullData.begin() + offset, fullData.begin() + offset + file_size);
+            
+            cout << sender << " sent file to " << dest << ": " << filename << " (" << file_size << " bytes)" << endl;
+            
+            // Reenviar archivo al destinatario
+            vector<string> packets = buildFile(sender, filename, file_data.data(), file_size);
+            sendToClient(dest, packets);
+            break;
+        }
+        
+        case 'o': { // Object transfer
+            cout << "DEBUG: Processing object transfer" << endl;
+            if (fullData.size() < offset + 2) {
+                cout << "DEBUG: Object data too short for sender length" << endl;
+                return;
+            }
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) {
+                cout << "DEBUG: Object data too short for sender name" << endl;
+                return;
+            }
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            cout << "DEBUG: Object from " << sender << endl;
+            
+            if (fullData.size() < offset + 2) {
+                cout << "DEBUG: Object data too short for destination length" << endl;
+                return;
+            }
+            uint16_t dlen;
+            memcpy(&dlen, fullData.c_str() + offset, 2);
+            dlen = ntohs(dlen);
+            offset += 2;
+            
+            if (fullData.size() < offset + dlen) {
+                cout << "DEBUG: Object data too short for destination name" << endl;
+                return;
+            }
+            string dest(fullData.c_str() + offset, dlen);
+            offset += dlen;
+            
+            if (fullData.size() < offset + 4) {
+                cout << "DEBUG: Object data too short for object size" << endl;
+                return;
+            }
+            uint32_t objSize;
+            memcpy(&objSize, fullData.c_str() + offset, 4);
+            objSize = ntohl(objSize);
+            offset += 4;
+            
+            cout << "DEBUG: Object size: " << objSize << ", available: " << (fullData.size() - offset) << endl;
+            
+            if (fullData.size() < offset + objSize) {
+                cout << "DEBUG: ERROR - Not enough data for object" << endl;
+                return;
+            }
+            vector<char> objectData(fullData.begin() + offset, fullData.begin() + offset + objSize);
+            
+            cout << "DEBUG: Object data received, forwarding to " << dest << endl;
+            
+            // Reenviar objeto al destinatario
+            vector<string> packets = buildObject(sender, objectData);
+            sendToClient(dest, packets);
+            break;
+        }
+        
+        case 'J': { // Game request
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 2) return;
+            uint16_t dlen;
+            memcpy(&dlen, fullData.c_str() + offset, 2);
+            dlen = ntohs(dlen);
+            offset += 2;
+            
+            if (fullData.size() < offset + dlen) return;
+            string dest(fullData.c_str() + offset, dlen);
+            
+            cout << sender << " sent game request to " << dest << endl;
+            vector<string> packets = buildGameRequest(sender);
+            sendToClient(dest, packets);
+            break;
+        }
+        
+        case 'j': { // Game response
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 2) return;
+            uint16_t rlen;
+            memcpy(&rlen, fullData.c_str() + offset, 2);
+            rlen = ntohs(rlen);
+            offset += 2;
+            
+            if (fullData.size() < offset + rlen) return;
+            string responder(fullData.c_str() + offset, rlen);
+            offset += rlen;
+            
+            if (fullData.size() < offset + 1) return;
+            char response = fullData[offset];
+            
+            cout << sender << " responded to game request from " << responder << ": " << response << endl;
+            
+            vector<string> packets = buildGameResponse(sender, response == 'y');
+            sendToClient(responder, packets);
+            
+            if (response == 'y') {
+                lock_guard<mutex> lock(games_mutex);
+                pair<string, string> gameKey = make_pair(min(sender, responder), max(sender, responder));
+                initializeGame(activeGames[gameKey], sender, responder);
+                
+                vector<string> boardPackets = buildBoard(activeGames[gameKey].board, activeGames[gameKey].currentPlayer);
+                sendToClient(sender, boardPackets);
+                sendToClient(responder, boardPackets);
+                cout << "Game started between " << sender << " and " << responder << endl;
+            }
+            break;
+        }
+        
+        case 'P': { // Game move
+            if (fullData.size() < offset + 2) return;
+            uint16_t slen;
+            memcpy(&slen, fullData.c_str() + offset, 2);
+            slen = ntohs(slen);
+            offset += 2;
+            
+            if (fullData.size() < offset + slen) return;
+            string sender(fullData.c_str() + offset, slen);
+            offset += slen;
+            
+            if (fullData.size() < offset + 4) return;
+            uint32_t position = ((unsigned char)fullData[offset] << 24) |
+                               ((unsigned char)fullData[offset+1] << 16) |
+                               ((unsigned char)fullData[offset+2] << 8) |
+                               (unsigned char)fullData[offset+3];
+            
+            cout << sender << " made move at position: " << position << endl;
+            
+            // Procesar movimiento del juego (código existente)
+            processGameMove(sender, position);
+            break;
+        }
+        
+        default:
+            cout << "Unknown message type: " << messageType << endl;
+            break;
+    }
+}
+
+// Función para procesar mensajes simples del cliente
+void processSimpleClientMessage(const string& client_nickname, const string& data, char messageType, 
+                               const sockaddr_in& client_addr, socklen_t addr_len, int server_fd) {
+    
+    switch (messageType) {
+        case 'l': { // List request
+            cout << client_nickname << " requested client list" << endl;
+            vector<string> packets = buildList();
+            sendToClient(client_nickname, packets);
+            break;
+        }
+        
+        case 'x': { // Close connection
+            cout << client_nickname << " disconnected" << endl;
+            {
+                lock_guard<mutex> lock(clients_mutex);
+                clients.erase(client_nickname);
+            }
+            break;
+        }
+        
+        case 'm': // Broadcast message
+        case 't': // Private message  
+        case 'f': // File transfer
+        case 'o': // Object transfer
+        case 'J': // Game request
+        case 'j': // Game response
+        case 'P': // Game move
+            // Procesar estos mensajes usando processCompleteMessage
+            processCompleteMessage(client_nickname, data.substr(1), messageType, client_addr, addr_len, server_fd);
+            break;
+        
+        default:
+            cout << "Unknown simple message type: " << messageType << endl;
+            break;
+    }
+}
+
+void processDatagram(int server_fd, char* buffer, int bytes_received, const sockaddr_in& client_addr, socklen_t addr_len, string client_nickname) {
+    if (bytes_received < 1) return;
+
+    string data(buffer, bytes_received);
+    
+    // Verificar si es un mensaje de nickname (siempre simple)
+    if (client_nickname.empty() && data[0] == 'n') {
+        processNicknameMessage(server_fd, data, client_addr, addr_len);
+        return;
+    }
+
+    // Si no tenemos nickname, ignorar el mensaje
+    if (client_nickname.empty()) {
+        return;
+    }
+
+    // Determinar si es un mensaje simple o fragmentado
+    char firstByte = data[0];
+    
+    // Si el primer byte es un carácter de mensaje válido del cliente
+    // (n, m, t, l, x, f, o, J, j, P) entonces es un mensaje simple completo
+    if ((firstByte >= 'a' && firstByte <= 'z') || firstByte == 'J' || firstByte == 'j' || firstByte == 'P') {
+        // Es un mensaje simple completo del cliente
+        processSimpleClientMessage(client_nickname, data, firstByte, client_addr, addr_len, server_fd);
+        return;
+    }
+
+    // Si llega aquí, es un mensaje fragmentado
+    string fragment = data;
+    string fullData;
+    char messageType = 0;
+    string client_id = client_nickname + ":" + to_string(client_addr.sin_port);
+    
+    if (reconstructPacket(client_id, fragment, fullData, messageType)) {
+        // Mensaje completo reconstruido
+        cout << "DEBUG: Reconstructed complete message of type: " << messageType << ", size: " << fullData.size() << endl;
+        processCompleteMessage(client_nickname, fullData, messageType, client_addr, addr_len, server_fd);
+    } else {
+        // Fragmento recibido pero aún no está completo
+        cout << "DEBUG: Received fragment from " << client_nickname << ", type: " << messageType 
+             << ", total fragments: " << reassemblyBuffers[client_id].fragments.size() << endl;
+    }
+}
+
+// Build close connection message
+vector<string> buildClose() {
+    string packet = "X";
+    vector<string> packets;
+    packets.push_back(completeDatagram(packet));
+    return packets;
+}
+
+// send a message to everyone except who is sending
+void sendAll(const vector<string> packets, const string& sender_nickname) {
+    lock_guard<mutex> lock(clients_mutex);
+    for (auto client : clients) {
+        if (client.first != sender_nickname) {
+            for (const auto& packet : packets) {
+                cout << "TO " << client.first << ": " << packet.substr(0, 100) << (packet.length() > 100 ? "..." : "") << endl;
+                
+                sendto(client.second.socket_fd,
+                       packet.c_str(),
+                       packet.size(),
+                       0,
+                       (struct sockaddr*)&client.second.address,
+                       client.second.addr_len);
+            }
+        }
+    }
+}
+
+// send a message to a specific client
+void sendToClient(const string dest, const vector<string> packets) {
+    lock_guard<mutex> lock(clients_mutex);
+    if (clients.count(dest)) {
+        for (const auto& packet : packets) {
+            cout << "TO " << dest << ": " << packet.substr(0, 100) << (packet.length() > 100 ? "..." : "") << endl;
+            
+            sendto(clients[dest].socket_fd,
+                   packet.c_str(),
+                   packet.size(),
+                   0,
+                   (struct sockaddr*)&clients[dest].address,
+                   clients[dest].addr_len);
+        }
+    }
+}
+
+// Build the error message with the protocol
+vector<string> buildError(const string& msg) {
+    string packet = "E";
+    uint32_t len = msg.size();
+    packet.push_back((len >> 16) & 0xFF);
+    packet.push_back((len >> 8) & 0xFF);
+    packet.push_back(len & 0xFF);
+    packet += msg;
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        return fragmentDatagram("E", msg, 3);
+    }
+}
+
+// Build the message with the protocol
+vector<string> buildBroadcast(const string& sender, const string& msg) {
+    string packet = "M";
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    uint32_t mlen = msg.size();
+    packet.push_back((mlen >> 16) & 0xFF);
+    packet.push_back((mlen >> 8) & 0xFF);
+    packet.push_back(mlen & 0xFF);
+    packet += msg;
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        return fragmentDatagram("M" + string((char*)&slen, 2) + sender, msg, 3);
+    }
+}
+
+// Build the message to a specific client with the protocol
+vector<string> buildToClient(const string& sender, const string& msg) {
+    string packet = "T";
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    uint32_t mlen = msg.size();
+    packet.push_back((mlen >> 16) & 0xFF);
+    packet.push_back((mlen >> 8) & 0xFF);
+    packet.push_back(mlen & 0xFF);
+    packet += msg;
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        return fragmentDatagram("T" + string((char*)&slen, 2) + sender, msg, 3);
+    }
+}
+
+//Build list with the protocol
+vector<string> buildList() {
+    lock_guard<mutex> lock(clients_mutex);
+    string all;
+    for (auto client : clients) {
+        uint16_t nick_len = htons(client.first.size());
+        all.append((char*)&nick_len, 2);
+        all += client.first;
+    }
+    
+    string packet = "L";
+    uint16_t total_len = htons(all.size());
+    packet.append((char*)&total_len, 2);
+    packet += all;
+    
+    packet = completeDatagram(packet);
+    vector<string> packets;
+    packets.push_back(packet);
+    return packets;
+}
+
+// Function to build file message
+vector<string> buildFile(const string& sender, const string& filename, const char* file_data, uint64_t file_size) {
+    string packet = "F";
+    
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    
+    uint32_t flen = filename.size();
+    packet.push_back((flen >> 16) & 0xFF);
+    packet.push_back((flen >> 8) & 0xFF);
+    packet.push_back(flen & 0xFF);
+    
+    packet += filename;
+    
+    for (int i = 9; i >= 0; i--) {
+        packet.push_back((file_size >> (i * 8)) & 0xFF);
+    }
+    
+    packet.append(file_data, file_size);
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        string header = "F" + string((char*)&slen, 2) + sender;
+        header.push_back((flen >> 16) & 0xFF);
+        header.push_back((flen >> 8) & 0xFF);
+        header.push_back(flen & 0xFF);
+        header += filename;
+        for (int i = 9; i >= 0; i--) {
+            header.push_back((file_size >> (i * 8)) & 0xFF);
+        }
+        
+        return fragmentDatagram(header, string(file_data, file_size), 0);
+    }
+}
+
+// Function to build object message
+vector<string> buildObject(const string& sender, const vector<char>& objectData) {
+    string packet = "O";
+    
+    uint16_t slen = htons(sender.size());
+    packet.append((char*)&slen, 2);
+    packet += sender;
+    
+    uint32_t objSize = htonl(static_cast<uint32_t>(objectData.size()));
+    packet.append(reinterpret_cast<const char*>(&objSize), sizeof(objSize));
+    
+    packet.append(objectData.data(), objectData.size());
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        string header = "O" + string((char*)&slen, 2) + sender;
+        header.append(reinterpret_cast<const char*>(&objSize), sizeof(objSize));
+        
+        return fragmentDatagram(header, string(objectData.data(), objectData.size()), 0);
+    }
+}
+
+vector<string> buildGameRequest(const string& sender) {
     string packet = "J";
     uint16_t slen = htons(sender.size());
     packet.append((char*)&slen, 2);
     packet += sender;
-    packet = completePacket(packet, lengthPacket);
-    return packet;
+    vector<string> packets;
+    packets.push_back(completeDatagram(packet));
+    return packets;
 }
 
-string buildGameResponse(const string& sender, bool accepted) {
+vector<string> buildGameResponse(const string& sender, bool accepted) {
     string packet = "j";
     uint16_t slen = htons(sender.size());
     packet.append((char*)&slen, 2);
     packet += sender;
     packet.push_back(accepted ? 'y' : 'n');
-    packet = completePacket(packet, lengthPacket);
-    return packet;
+    vector<string> packets;
+    packets.push_back(completeDatagram(packet));
+    return packets;
 }
 
-// Modified buildBoard to include current player
-string buildBoard(const vector<char>& board, const string& currentPlayer) {
+vector<string> buildBoard(const vector<char>& board, const string& currentPlayer) {
     string packet = "B";
     uint16_t board_len = htons(board.size());
     packet.append((char*)&board_len, 2);
@@ -269,29 +786,36 @@ string buildBoard(const vector<char>& board, const string& currentPlayer) {
     uint16_t player_len = htons(currentPlayer.size());
     packet.append((char*)&player_len, 2);
     packet += currentPlayer;
-    packet = completePacket(packet, lengthPacket);
-    return packet;
+    
+    if (packet.size() <= (size_t)maxDatagramLength) {
+        vector<string> packets;
+        packets.push_back(completeDatagram(packet));
+        return packets;
+    } else {
+        string header = "B" + string((char*)&board_len, 2);
+        string data = string(board.begin(), board.end()) + string((char*)&player_len, 2) + currentPlayer;
+        
+        return fragmentDatagram(header, data, 0);
+    }
 }
 
-string buildGameResult(char result) {
+vector<string> buildGameResult(char result) {
     string packet = "W";
     packet.push_back(result);
-    packet = completePacket(packet, lengthPacket);
-    return packet;
+    vector<string> packets;
+    packets.push_back(completeDatagram(packet));
+    return packets;
 }
 
 bool checkWinner(const vector<char>& board, char player) {
-    // Rows
     for (int i = 0; i < 3; i++) {
         if (board[i*3] == player && board[i*3+1] == player && board[i*3+2] == player)
             return true;
     }
-    // Columns
     for (int i = 0; i < 3; i++) {
         if (board[i] == player && board[i+3] == player && board[i+6] == player)
             return true;
     }
-    // Diagonals
     if (board[0] == player && board[4] == player && board[8] == player) return true;
     if (board[2] == player && board[4] == player && board[6] == player) return true;
     
@@ -313,274 +837,101 @@ void initializeGame(Game& game, const string& p1, const string& p2) {
     game.gameActive = true;
 }
 
-// Manage each client with threads
-void handleClient(int client_socket) {
-    char header[4];
-    string nickname;
-
-    // Read nickname (n)
-    if (recv(client_socket, header, 1, 0) <= 0) { close(client_socket); return; }
-    if (header[0] != 'n') { close(client_socket); return; }
-
-    //length of nickname
-    if (recv(client_socket, header, 2, 0) <= 0) { close(client_socket); return; }
-    uint16_t nlen;
-    memcpy(&nlen, header, 2);
-    nlen = ntohs(nlen);
-
-    //take the nickname
-    char* buffer = new char[nlen+1];
-    if (recv(client_socket, buffer, nlen, 0) <= 0) { delete[] buffer; close(client_socket); return; }
-    buffer[nlen]='\0';
-    nickname = string(buffer);
-    delete[] buffer;
-
-    // Print received nickname protocol
-    string nickPacket = "n";
-    uint16_t nlen_net = htons(nlen);
-    nickPacket.append((char*)&nlen_net, 2);
-    nickPacket += nickname;
-    cout << nickname << " received: " << formatProtocol(nickPacket) << endl;
-
-    {
-        lock_guard<mutex> lock(clients_mutex);
-        if (clients.count(nickname)) {
-            vector<string> errors = buildError("Nickname already taken");
-            for(auto err:errors){
-                cout << "Server sending error to " << nickname << ": " << formatProtocol(err) << endl;
-                send(client_socket, err.c_str(), err.size(), 0);
-            }
-            close(client_socket);
-            return;
+void processGameMove(const string& player, uint32_t position) {
+    lock_guard<mutex> lock(games_mutex);
+    Game* currentGame = nullptr;
+    string opponent;
+    pair<string, string> gameKey;
+    
+    for (auto& game : activeGames) {
+        if ((game.second.player1 == player || game.second.player2 == player) && 
+            game.second.gameActive) {
+            currentGame = &game.second;
+            opponent = (game.second.player1 == player) ? game.second.player2 : game.second.player1;
+            gameKey = game.first;
+            break;
         }
-        clients[nickname] = client_socket;
-    }
-
-    cout << nickname << " connected" << endl;
-
-    while (true) {
-
-        char buffer[777];
-
-        int r = recv(client_socket, buffer, 777, 0);
-        if (r <= 0) break;
-
-        string fragment(buffer,r);
-        string completePacket;
-
-        if (reconstructPacket(client_socket, fragment, completePacket)) {
-            char type = completePacket[0];
-
-            if (type == 'm') {
-                int len = ((unsigned char)completePacket[1] << 16) |
-                        ((unsigned char)completePacket[2] << 8) |
-                        (unsigned char)completePacket[3];
-
-                string message = completePacket.substr(4, len);
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                vector<string> msgs = buildBroadcast(nickname, message);
-                for (auto &msg : msgs) sendAll(msg, client_socket);
-            }
-
-            else if (type == 't') {
-                uint16_t dlen;
-                memcpy(&dlen, &completePacket[1], 2);
-                dlen = ntohs(dlen);
-                string dest = completePacket.substr(3, dlen);
-
-                int mlen = ((unsigned char)completePacket[3 + dlen] << 16) |
-                        ((unsigned char)completePacket[3 + dlen + 1] << 8) |
-                        (unsigned char)completePacket[3 + dlen + 2];
-                string message = completePacket.substr(3 + dlen + 3, mlen);
-
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                vector<string> msgs = buildToClient(nickname, message);
-                for (auto &msg : msgs) sendToClient(dest, msg);
-            }
-
-            else if (type == 'l') {
-                cout << nickname << " received: l" << endl;
-                string list = buildList();
-                cout << "Server sending list to " << nickname << ": " << formatProtocol(list) << endl;
-                send(client_socket, list.c_str(), list.size(), 0);
-            }
-
-            else if (type == 'x') {
-                cout << nickname << " received: x" << endl;
-                break;
-            }
-            else if (type == 'f') {
-                // [f][2 bytes dlen][dest][3 bytes flen][filename][10 bytes fsize][file data]
-                uint16_t dlen;
-                memcpy(&dlen, &completePacket[1], 2);
-                dlen = ntohs(dlen);
-
-                string dest = completePacket.substr(3, dlen);
-
-                int dataOffset = 3 + dlen;
-                int flen = ((unsigned char)completePacket[dataOffset] << 16) |
-                        ((unsigned char)completePacket[dataOffset + 1] << 8) |
-                        (unsigned char)completePacket[dataOffset + 2];
-
-                string filename = completePacket.substr(dataOffset + 3, flen);
-
-                uint64_t fsize = 0;
-                int fsizeOffset = dataOffset + 3 + flen;
-                for (int i = 0; i < 10; i++) {
-                    fsize = (fsize << 8) | (unsigned char)completePacket[fsizeOffset + i];
-                }
-
-                string fileData = completePacket.substr(3 + dlen + 3 + flen + 10);
-
-                cout << nickname << " received: " << formatProtocol(completePacket)<< endl;
-
-                vector<string> packets = buildFile(nickname, filename, fileData.c_str(), fsize, lengthPacket);
-                for (auto &packet : packets) sendToClient(dest, packet);
-            }
-            else if (type == 'o') {
-                // [o][2 bytes dlen][dest][4 bytes objSize][object data]
-                uint16_t dlen;
-                memcpy(&dlen, &completePacket[1], 2);
-                dlen = ntohs(dlen);
-
-                string dest = completePacket.substr(3, dlen);
-
-                uint32_t objSize;
-                memcpy(&objSize, &completePacket[3 + dlen], 4);
-                objSize = ntohl(objSize);
-
-                vector<char> objectBuf(objSize);
-                memcpy(objectBuf.data(), &completePacket[3 + dlen + 4], objSize);
-
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                vector<string> msgs = buildObject(nickname, objectBuf);
-                for (auto &msg : msgs) sendToClient(dest, msg);
-            }
-            else if (type == 'J') {
-                uint16_t dlen;
-                memcpy(&dlen, &completePacket[1], 2);
-                dlen = ntohs(dlen);
-                string dest = completePacket.substr(3, dlen);
-
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                lock_guard<mutex> lock(clients_mutex);
-                if (clients.count(dest)) {
-                    string msg = buildGameRequest(nickname);
-                    sendToClient(dest, msg);
-                } else {
-                    vector<string> errors = buildError("User not found");
-                    for(auto err:errors){
-                        send(client_socket, err.c_str(), err.size(), 0);
-                    }
-                }
-            }
-            else if (type == 'j') {
-                uint16_t slen;
-                memcpy(&slen, &completePacket[1], 2);
-                slen = ntohs(slen);
-
-                string sender = completePacket.substr(3, slen);
-                char response = completePacket[3 + slen];
-
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                string msg = buildGameResponse(nickname, response == 'y');
-                sendToClient(sender, msg);
-
-                if (response == 'y') {
-                    lock_guard<mutex> lock(games_mutex);
-                    auto key = make_pair(min(nickname, sender), max(nickname, sender));
-                    initializeGame(activeGames[key], nickname, sender);
-
-                    string boardPacket = buildBoard(activeGames[key].board, activeGames[key].currentPlayer);
-                    sendToClient(nickname, boardPacket);
-                    sendToClient(sender, boardPacket);
-                }
-            }
-            else if (type == 'P') {
-                uint32_t pos = ((unsigned char)completePacket[1] << 24) |
-                            ((unsigned char)completePacket[2] << 16) |
-                            ((unsigned char)completePacket[3] << 8) |
-                            (unsigned char)completePacket[4];
-
-                lock_guard<mutex> lock(games_mutex);
-                Game* g = nullptr;
-                string opponent;
-                pair<string,string> key;
-
-                cout << nickname << " received: " << formatProtocol(completePacket) << endl;
-
-                for (auto& entry : activeGames) {
-                    if ((entry.second.player1 == nickname || entry.second.player2 == nickname) && entry.second.gameActive) {
-                        g = &entry.second;
-                        opponent = (entry.second.player1 == nickname) ? entry.second.player2 : entry.second.player1;
-                        key = entry.first;
-                        break;
-                    }
-                }
-
-                if (!g) return;
-                if (g->currentPlayer != nickname) return;
-                if (pos >= 9) return;
-
-                if (g->board[pos] == ' ') {
-                    g->board[pos] = (nickname == g->player1) ? 'X' : 'O';
-                    char symbol = (nickname == g->player1) ? 'X' : 'O';
-
-                    if (checkWinner(g->board, symbol)) {
-                        string win = buildGameResult('1');
-                        string lose = buildGameResult('0');
-                        sendToClient(nickname, win);
-                        sendToClient(opponent, lose);
-                        activeGames.erase(key);
-                    } else if (checkIsPositionUsed(g->board)) {
-                        string draw = buildGameResult('2');
-                        sendToClient(nickname, draw);
-                        sendToClient(opponent, draw);
-                        activeGames.erase(key);
-                    } else {
-                        g->currentPlayer = opponent;
-                        string boardPacket = buildBoard(g->board, g->currentPlayer);
-                        sendToClient(nickname, boardPacket);
-                        sendToClient(opponent, boardPacket);
-                    }
-                }
-            }
-        }
-    }
-
-    {
-        lock_guard<mutex> lock(clients_mutex);
-        clients.erase(nickname);
     }
     
-    // Remove any active games involving this player
-    {
-        lock_guard<mutex> lock(games_mutex);
-        vector<pair<string, string>> toRemove;
-        for (auto& game : activeGames) {
-            if (game.second.player1 == nickname || game.second.player2 == nickname) {
-                toRemove.push_back(game.first);
-            }
+    if (!currentGame) {
+        vector<string> err = buildError("No active game found");
+        sendToClient(player, err);
+        return;
+    }
+    
+    if (currentGame->currentPlayer != player) {
+        vector<string> err = buildError("Not your turn");
+        sendToClient(player, err);
+        return;
+    }
+    
+    if (position >= 9) {
+        vector<string> err = buildError("Invalid position");
+        sendToClient(player, err);
+        return;
+    }
+    
+    if (currentGame->board[position] == ' ') {
+        currentGame->board[position] = (player == currentGame->player1) ? 'X' : 'O';
+        
+        char currentSymbol = (player == currentGame->player1) ? 'X' : 'O';
+        if (checkWinner(currentGame->board, currentSymbol)) {
+            vector<string> result1 = buildGameResult('1');
+            vector<string> result2 = buildGameResult('0');
+            sendToClient(player, result1);
+            sendToClient(opponent, result2);
+            currentGame->gameActive = false;
+            activeGames.erase(gameKey);
+            cout << "Game finished. Winner: " << player << endl;
+        } else if (checkIsPositionUsed(currentGame->board)) {
+            vector<string> result = buildGameResult('2');
+            sendToClient(player, result);
+            sendToClient(opponent, result);
+            currentGame->gameActive = false;
+            activeGames.erase(gameKey);
+            cout << "Game finished in draw between " << player << " and " << opponent << endl;
+        } else {
+            currentGame->currentPlayer = opponent;
+            vector<string> boardPackets = buildBoard(currentGame->board, currentGame->currentPlayer);
+            sendToClient(player, boardPackets);
+            sendToClient(opponent, boardPackets);
+            cout << "Turn switched to: " << currentGame->currentPlayer << endl;
         }
-        for (auto& key : toRemove) {
-            // Notify the other player that the game ended
-            string otherPlayer = (activeGames[key].player1 == nickname) ? 
-                               activeGames[key].player2 : activeGames[key].player1;
-            if (clients.count(otherPlayer)) {
-                string result = buildGameResult('3');
-                sendToClient(otherPlayer, result);
+    } else {
+        vector<string> err = buildError("Position already occupied");
+        sendToClient(player, err);
+    }
+}
+
+void handleClient(int server_fd) {
+    char buffer[MAX_DATAGRAM_SIZE];
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    
+    int bytes_received = recvfrom(server_fd, 
+                                  buffer, 
+                                  MAX_DATAGRAM_SIZE, 
+                                  0, 
+                                  (struct sockaddr*)&client_addr, 
+                                  &addr_len);
+
+    if (bytes_received <= 0) {
+        return;
+    }
+
+    string nickname = "";
+    {
+        lock_guard<mutex> lock(clients_mutex);
+        for (auto const& [nick, info] : clients) {
+            if (info.address.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
+                info.address.sin_port == client_addr.sin_port) {
+                nickname = nick;
+                break;
             }
-            activeGames.erase(key);
         }
     }
 
-    cout << nickname << " disconnected" << endl;
-    close(client_socket);
+    processDatagram(server_fd, buffer, bytes_received, client_addr, addr_len, nickname);
 }
 
 int main() {
@@ -588,21 +939,29 @@ int main() {
     struct sockaddr_in address;
     int opt = 1;
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd = socket(AF_INET, SOCK_DGRAM, 0);
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
     bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 3);
 
     cout << "Server listening on port " << PORT << endl;
 
     while (true) {
-        int client_socket = accept(server_fd, nullptr, nullptr);
-        thread t(handleClient, client_socket);
-        t.detach();
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd, &read_fds);
+
+        if (select(server_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
+            perror("select error");
+            break;
+        }
+
+        if (FD_ISSET(server_fd, &read_fds)) {
+            handleClient(server_fd);
+        }
     }
 
     return 0;
